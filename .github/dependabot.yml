@@ -1,0 +1,52 @@
+# Automatically update versions for pip and npm
+
+version: 2
+updates:
+
+  # Maintain dependencies for Python
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+      time: "00:00"
+    cooldown:
+      default-days: 7
+
+  # Maintain dependencies for Javascript
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+      time: "00:00"
+    cooldown:
+      default-days: 7
+      exclude:
+        - kolibri-build
+        - kolibri-constants
+        - kolibri-design-system
+        - kolibri-format
+        - kolibri-i18n
+        - kolibri-logging
+    groups:
+      babel:
+        patterns:
+          - "@babel/*"
+      tiptap:
+        patterns:
+          - "@tiptap/*"
+      jest:
+        patterns:
+          - "jest*"
+
+  # Maintain dependencies for Github Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+      time: "00:00"
+    cooldown:
+      default-days: 7
+    groups:
+      github:
+        patterns:
+          - "actions/*"

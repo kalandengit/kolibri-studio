@@ -1,0 +1,18 @@
+{% load i18n %}
+
+{% autoescape off %}
+{% blocktrans with name=user.first_name %}Hello {{ name }},{% endblocktrans %}
+
+{% blocktrans with site_name=site.name %}You have requested a password reset link on {{ site_name }} without first activating your account.{% endblocktrans %}
+
+{% translate "Please activate your account by following the link below:" %}
+
+{{ domain }}{% url 'registration_activate' activation_key %}
+
+{% blocktrans %}This link is valid for {{ expiration_days }} days.{% endblocktrans %}
+
+{% translate "Thanks for using Kolibri Studio!" %}
+
+{% translate "The Learning Equality Team" %}
+
+{% endautoescape %}

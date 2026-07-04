@@ -1,0 +1,103 @@
+# Self-contained production-style deployment of Kolibri Studio for a single VPS.
+# Used by deploy/install-vps.sh. Configuration comes from deploy/.env
+#
+#   docker compose -f deploy/docker-compose.deploy.yml --env-file deploy/.env up -d
+
+x-studio-environment: &studio-environment
+  DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE:-contentcuration.not_production_settings}
+  DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?set in deploy/.env}
+  DATA_DB_HOST: postgres
+  DATA_DB_NAME: ${POSTGRES_DB:-kolibri-studio}
+  DATA_DB_USER: ${POSTGRES_USER:-learningequality}
+  DATA_DB_PASS: ${POSTGRES_PASSWORD:?set in deploy/.env}
+  CELERY_TIMEZONE: ${CELERY_TIMEZONE:-UTC}
+  CELERY_REDIS_DB: 0
+  CACHE_REDIS_DB: 1
+  CELERY_BROKER_ENDPOINT: redis
+  CELERY_RESULT_BACKEND_ENDPOINT: redis
+  CELERY_REDIS_PASSWORD: ""
+  AWS_S3_ENDPOINT_URL: http://minio:9000
+  AWS_BUCKET_NAME: ${MINIO_BUCKET:-content}
+  AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-development}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?set in deploy/.env}
+  REMAP_SIGTERM: "SIGQUIT"
+  MPLBACKEND: ps
+  SHELL: /bin/bash
+  RUN_MODE: docker-compose
+
+x-studio-worker: &studio-worker
+  image: learningequality/studio-app-prod
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.prod
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_started
+    minio:
+      condition: service_started
+  environment: *studio-environment
+
+services:
+  studio-app:
+    <<: *studio-worker
+    # gunicorn on 8081 (see `make altprodserver`)
+    ports:
+      - "${STUDIO_HTTP_PORT:-8080}:8081"
+
+  celery-worker:
+    <<: *studio-worker
+    entrypoint: []
+    command: make prodceleryworkers
+
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRES_USER: ${POSTGRES_USER:-learningequality}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in deploy/.env}
+      POSTGRES_DB: ${POSTGRES_DB:-kolibri-studio}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - pgdata:/var/lib/postgresql/data/pgdata
+
+  redis:
+    image: redis:6.2
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-development}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set in deploy/.env}
+    volumes:
+      - minio:/data
+
+  # One-shot: create the content bucket and allow anonymous downloads.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD}; do sleep 2; done;
+      mc mb --ignore-existing local/$${MINIO_BUCKET};
+      mc anonymous set download local/$${MINIO_BUCKET};
+      exit 0"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-development}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set in deploy/.env}
+      MINIO_BUCKET: ${MINIO_BUCKET:-content}
+
+volumes:
+  pgdata:
+  minio:

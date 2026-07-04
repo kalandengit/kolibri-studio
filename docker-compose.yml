@@ -1,0 +1,92 @@
+x-studio-environment:
+  &studio-environment
+    MPLBACKEND: ps
+    SHELL: /bin/bash
+    AWS_S3_ENDPOINT_URL: http://minio:9000
+    AWS_BUCKET_NAME: content
+    DATA_DB_HOST: postgres
+    DJANGO_SETTINGS_MODULE: contentcuration.dev_settings
+    RUN_MODE: docker-compose
+    CELERY_TIMEZONE: America/Los_Angeles
+    CELERY_REDIS_DB: 0
+    CELERY_BROKER_ENDPOINT: redis
+    CELERY_RESULT_BACKEND_ENDPOINT: redis
+    CELERY_REDIS_PASSWORD: ""
+    REMAP_SIGTERM: "SIGQUIT"
+    WEBPACK_DEV_HOST: 0.0.0.0
+
+x-studio-worker:
+  &studio-worker
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dev
+    image: learningequality/studio-app-dev
+    depends_on:
+      - minio
+      - postgres
+      - redis
+    volumes:
+      - .:/src
+    environment: *studio-environment
+
+services:
+  studio-nginx:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.nginx.prod
+    ports:
+      - "8081:8080"
+    depends_on:
+      - studio-app
+    environment: *studio-environment
+
+  studio-app:
+    <<: *studio-worker
+    entrypoint: python docker/studio-dev/entrypoint.py
+    command: pnpm run devserver
+    ports:
+      - "8080:8080"
+      - "4000:4000"
+
+  celery-worker:
+    <<: *studio-worker
+    command: make prodceleryworkers
+
+  # this service is for development emulation only
+  minio:
+    image: 'bitnamilegacy/minio:2024.5.28'
+    environment:
+      - "MINIO_DEFAULT_BUCKETS=content:public"
+      - MINIO_ROOT_USER=development
+      - MINIO_ROOT_PASSWORD=development
+    ports:
+      - "9000:9000"
+    volumes:
+      - minio:/bitnami/minio/data
+
+  postgres:
+    image: ghcr.io/learningequality/postgres
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.postgres.dev
+    environment:
+      PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRES_USER: learningequality
+      POSTGRES_PASSWORD: kolibri
+      POSTGRES_DB: kolibri-studio
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data/pgdata
+      - .docker/postgres:/docker-entrypoint-initdb.d
+
+  redis:
+    image: redis:6.0.9
+    ports:
+      - "6379:6379"
+
+
+volumes:
+  minio:
+  pgdata:

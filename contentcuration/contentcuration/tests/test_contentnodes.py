@@ -1,0 +1,2277 @@
+import json
+import random
+import string
+import time
+import uuid
+
+import pytest
+from django.db import IntegrityError
+from django.db.utils import DataError
+from le_utils.constants import completion_criteria
+from le_utils.constants import content_kinds
+from le_utils.constants import exercises
+from le_utils.constants import format_presets
+from le_utils.constants import modalities
+from mixer.backend.django import mixer
+from mock import patch
+
+from . import testdata
+from .base import StudioTestCase
+from .testdata import create_studio_file
+from contentcuration.constants import completion_criteria as studio_completion_criteria
+from contentcuration.management.commands.fix_exercise_extra_fields import (
+    Command as FixExerciseExtraFieldsCommand,
+)
+from contentcuration.models import AssessmentItem
+from contentcuration.models import Channel
+from contentcuration.models import ContentKind
+from contentcuration.models import ContentNode
+from contentcuration.models import ContentTag
+from contentcuration.models import File
+from contentcuration.models import FormatPreset
+from contentcuration.models import generate_storage_url
+from contentcuration.models import Language
+from contentcuration.models import License
+from contentcuration.utils.db_tools import TreeBuilder
+from contentcuration.utils.files import create_thumbnail_from_base64
+from contentcuration.utils.nodes import migrate_extra_fields
+from contentcuration.utils.sync import sync_node
+
+
+def _create_nodes(num_nodes, title, parent=None, levels=2):
+    topic, _created = ContentKind.objects.get_or_create(kind="Topic")
+
+    for i in range(num_nodes):
+        new_node = ContentNode.objects.create(title=title, parent=parent, kind=topic)
+        # create a couple levels for testing purposes
+        if i > 0 and levels > 1 and i % (num_nodes // levels) == 0:
+            parent = new_node
+
+
+def _check_nodes(
+    parent, title=None, original_channel_id=None, source_channel_id=None, channel=None
+):
+    for node in parent.get_children():
+        if title:
+            assert node.title == title
+        assert node.parent == parent
+        if original_channel_id:
+            assert (
+                node.original_channel_id == original_channel_id
+            ), "Node {} with title {} has an incorrect original_channel_id.".format(
+                node.pk, node.title
+            )
+        if channel:
+            assert node.get_channel() == channel
+        if source_channel_id:
+            assert node.source_channel_id == source_channel_id
+        _check_nodes(node, title, original_channel_id, source_channel_id, channel)
+
+
+def _check_files_for_object(source, copy):
+    source_files = source.files.all().order_by("file_on_disk")
+    copy_files = copy.files.all().order_by("file_on_disk")
+    assert len(source_files) == len(copy_files)
+    for source_file, copy_file in zip(source_files, copy_files):
+        assert source_file.file_on_disk == copy_file.file_on_disk
+        assert source_file.preset_id == copy_file.preset_id
+
+
+def _check_tags_for_node(source, copy):
+    source_tags = source.tags.all().order_by("tag_name").distinct("tag_name")
+    copy_tags = copy.tags.all().order_by("tag_name")
+    assert len(source_tags) == len(copy_tags)
+    for source_tag, copy_tag in zip(source_tags, copy_tags):
+        assert source_tag.tag_name == copy_tag.tag_name
+        assert copy_tag.channel_id is None
+
+
+def _check_node_copy(source, copy, original_channel_id=None, channel=None):
+    source_children = source.get_children()
+    copy.refresh_from_db()
+    copy_children = copy.get_children()
+    assert len(source_children) == len(copy_children)
+    for child_source, child_copy in zip(source_children, copy_children):
+        assert child_copy.title == child_source.title
+        assert child_copy.description == child_source.description
+        assert child_copy.content_id == child_source.content_id
+        assert child_copy.node_id != child_source.node_id
+        assert child_copy.language_id == child_source.language_id
+        assert child_copy.license_id == child_source.license_id
+        assert child_copy.license_description == child_source.license_description
+        assert child_copy.thumbnail_encoding == child_source.thumbnail_encoding
+        assert child_copy.extra_fields == child_source.extra_fields
+        assert child_copy.copyright_holder == child_source.copyright_holder
+        assert child_copy.author == child_source.author
+        assert child_copy.aggregator == child_source.aggregator
+        assert child_copy.provider == child_source.provider
+        assert child_copy.role_visibility == child_source.role_visibility
+        assert child_copy.grade_levels == child_source.grade_levels
+        assert child_copy.resource_types == child_source.resource_types
+        assert child_copy.learning_activities == child_source.learning_activities
+        assert child_copy.accessibility_labels == child_source.accessibility_labels
+        assert child_copy.categories == child_source.categories
+        assert child_copy.learner_needs == child_source.learner_needs
+        assert child_copy.suggested_duration == child_source.suggested_duration
+        assert child_copy.changed
+        assert not child_copy.published
+        assert child_copy.complete == child_source.complete
+        assert child_copy.parent == copy
+        assert not child_copy.prerequisite.exists()
+        assert not child_copy.is_prerequisite_of.exists()
+        assert child_copy.original_channel_id == (
+            child_source.original_channel_id or original_channel_id
+        ), "Node {} with title {} has an incorrect original_channel_id.".format(
+            child_copy.pk, child_copy.title
+        )
+        assert (
+            child_copy.original_source_node_id == source.original_source_node_id
+            or source.node_id
+        )
+        if channel:
+            assert child_copy.get_channel() == channel
+        assert child_copy.source_channel_id == child_source.get_channel().id
+        _check_files_for_object(child_source, child_copy)
+        source_assessments = child_source.assessment_items.all().order_by("order")
+        copy_assessments = child_copy.assessment_items.all().order_by("order")
+        assert len(source_assessments) == len(copy_assessments)
+        for source_assessment, copy_assessment in zip(
+            source_assessments, copy_assessments
+        ):
+            _check_files_for_object(source_assessment, copy_assessment)
+            assert source_assessment.question == copy_assessment.question
+            assert source_assessment.answers == copy_assessment.answers
+            assert source_assessment.hints == copy_assessment.hints
+            assert source_assessment.assessment_id == copy_assessment.assessment_id
+        _check_tags_for_node(child_source, child_copy)
+        _check_node_copy(child_source, child_copy, original_channel_id, channel)
+
+
+class NodeGettersTestCase(StudioTestCase):
+    def setUp(self):
+        super(NodeGettersTestCase, self).setUpBase()
+
+        self.channel = testdata.channel()
+        self.topic, _created = ContentKind.objects.get_or_create(kind="Topic")
+        self.thumbnail_data = "allyourbase64arebelongtous"
+
+    def test_get_node_thumbnail_base64(self):
+        new_node = ContentNode.objects.create(
+            title="Heyo!", parent=self.channel.main_tree, kind=self.topic
+        )
+
+        new_node.thumbnail_encoding = '{"base64": "%s"}' % self.thumbnail_data
+
+        assert new_node.get_thumbnail() == self.thumbnail_data
+
+    def test_get_node_thumbnail_file(self):
+        new_node = ContentNode.objects.create(
+            title="Heyo!", parent=self.channel.main_tree, kind=self.topic
+        )
+        thumbnail_file = create_thumbnail_from_base64(testdata.base64encoding())
+        thumbnail_file.contentnode = new_node
+
+        # we need to make sure the file is marked as a thumbnail
+        preset, _created = FormatPreset.objects.get_or_create(id="video_thumbnail")
+        preset.thumbnail = True
+        thumbnail_file.preset = preset
+        thumbnail_file.save()
+
+        assert new_node.get_thumbnail() == generate_storage_url(str(thumbnail_file))
+
+    def test_get_node_details(self):
+        details = self.channel.main_tree.get_details()
+        assert details["resource_count"] > 0
+        assert details["resource_size"] > 0
+        assert len(details["kind_count"]) > 0
+
+        # assert format of list fields, including that they do not contain invalid data
+        list_fields = [
+            "kind_count",
+            "languages",
+            "accessible_languages",
+            "licenses",
+            "tags",
+            "original_channels",
+            "authors",
+            "aggregators",
+            "providers",
+            "copyright_holders",
+        ]
+        for field in list_fields:
+            self.assertIsInstance(
+                details.get(field), list, f"Field '{field}' isn't a list"
+            )
+            self.assertEqual(
+                len(details[field]),
+                len([value for value in details[field] if value]),
+                f"List field '{field}' has falsy values",
+            )
+
+    def test_get_details_with_null_provenance_fields(self):
+        node = ContentNode.objects.create(
+            title="Null Fields Test",
+            parent=self.channel.main_tree,
+            kind=self.topic,
+            author=None,
+            provider=None,
+            aggregator=None,
+            copyright_holder=None,
+        )
+
+        details = node.get_details()
+
+        assert details["authors"] == []
+        assert details["providers"] == []
+        assert details["aggregators"] == []
+        assert details["copyright_holders"] == []
+
+
+class NodeOperationsTestCase(StudioTestCase):
+    def setUp(self):
+        super(NodeOperationsTestCase, self).setUpBase()
+
+        self.channel = testdata.channel()
+        tree = TreeBuilder()
+        self.channel.main_tree = tree.root
+        self.channel.save()
+
+    @pytest.mark.skipif(True, reason="Benchmarking test")
+    def test_duplicate_nodes_benchmark(self):
+        """
+        Benchmarks copy operations with different batch_sizes
+        """
+        for batch_size in [50, 75, 100, 150, 200, 400, 500]:
+            new_channel = testdata.channel()
+            start = time.time()
+            with patch(
+                "contentcuration.db.models.manager.log_lock_time_spent"
+            ) as mock_log:
+                self.channel.main_tree.copy_to(
+                    new_channel.main_tree, batch_size=batch_size
+                )
+                timings = [log[0][0] for log in mock_log.call_args_list]
+            print(
+                "Batch size: {} took {} seconds to copy".format(
+                    batch_size, time.time() - start
+                )
+            )
+            total_lock_time = sum(timings)
+            total_locks = len(timings)
+            print(
+                "Batch size: {} spent an average of {} seconds in mptt locks with {} locks for a total of {}".format(
+                    batch_size,
+                    total_lock_time / total_locks,
+                    total_locks,
+                    total_lock_time,
+                )
+            )
+
+    def test_duplicate_nodes_shallow(self):
+        """
+        Ensures that when we copy nodes in a shallow way, a full copy happens
+        """
+        new_channel = testdata.channel()
+
+        # simulate a clean, right-after-publish state to ensure only new channel is marked as change
+        self.channel.main_tree.changed = False
+        self.channel.main_tree.save()
+        self.channel.main_tree.refresh_from_db()
+        self.assertFalse(self.channel.main_tree.changed)
+
+        new_channel.main_tree.changed = False
+        new_channel.main_tree.save()
+        new_channel.main_tree.refresh_from_db()
+        self.assertFalse(new_channel.main_tree.changed)
+
+        self.channel.main_tree.copy_to(new_channel.main_tree, batch_size=1)
+
+        _check_node_copy(
+            self.channel.main_tree,
+            new_channel.main_tree.get_children().last(),
+            original_channel_id=self.channel.id,
+            channel=new_channel,
+        )
+        new_channel.main_tree.refresh_from_db()
+        self.assertTrue(new_channel.main_tree.changed)
+
+        self.channel.main_tree.refresh_from_db()
+        self.assertFalse(self.channel.main_tree.changed)
+
+    def test_duplicate_nodes_shallow_refreshes(self):
+        """
+        Ensures that when we copy nodes in a shallow way, target nodes get refreshed
+        """
+        new_channel = testdata.channel()
+
+        new_channel.main_tree.copy_to(self.channel.main_tree, batch_size=1)
+
+        new_channel.main_tree.copy_to(
+            self.channel.main_tree.get_children().first(), batch_size=1
+        )
+
+        new_channel.main_tree.copy_to(self.channel.main_tree, batch_size=1)
+
+        last_rght = None
+
+        for new_node in self.channel.main_tree.get_children():
+            # All the new nodes should be immediate siblings, so their
+            # lft and rght values should be an incrementing sequence
+            if last_rght is not None:
+                self.assertEqual(last_rght + 1, new_node.lft)
+            last_rght = new_node.rght
+
+    def test_duplicate_nodes_position_right_shallow(self):
+        """
+        Ensures that when we copy nodes to the right, they are inserted at the next position
+        Testing with shallow batch_size of 1
+        """
+        new_channel = testdata.channel()
+
+        # simulate a clean, right-after-publish state to ensure only new channel is marked as change
+        self.channel.main_tree.changed = False
+        self.channel.main_tree.title = "Some other name"
+        self.channel.main_tree.save()
+        self.channel.main_tree.refresh_from_db()
+
+        self.channel.main_tree.copy_to(
+            new_channel.main_tree.get_children()[0], position="right", batch_size=1
+        )
+
+        self.assertEqual(
+            new_channel.main_tree.get_children()[1].title, self.channel.main_tree.title
+        )
+
+    def test_duplicate_nodes_position_right_mixed(self):
+        """
+        Ensures that when we copy nodes to the right, they are inserted at the next position
+        Testing with a mixed/medium batch size of 1000
+        """
+        new_channel = testdata.channel()
+
+        # simulate a clean, right-after-publish state to ensure only new channel is marked as change
+        self.channel.main_tree.changed = False
+        self.channel.main_tree.title = "Some other name"
+        self.channel.main_tree.save()
+        self.channel.main_tree.refresh_from_db()
+
+        self.channel.main_tree.copy_to(
+            new_channel.main_tree.get_children()[0], position="right", batch_size=1000
+        )
+
+        self.assertEqual(
+            new_channel.main_tree.get_children()[1].title, self.channel.main_tree.title
+        )
+
+    def test_duplicate_nodes_position_right_deep(self):
+        """
+        Ensures that when we copy nodes to the right, they are inserted at the next position
+        Testing with deep batch_size of 10,000
+        """
+        new_channel = testdata.channel()
+
+        # simulate a clean, right-after-publish state to ensure only new channel is marked as change
+        self.channel.main_tree.changed = False
+        self.channel.main_tree.title = "Some other name"
+        self.channel.main_tree.save()
+        self.channel.main_tree.refresh_from_db()
+
+        self.channel.main_tree.copy_to(
+            new_channel.main_tree.get_children()[0], position="right", batch_size=10000
+        )
+
+        self.assertEqual(
+            new_channel.main_tree.get_children()[1].title, self.channel.main_tree.title
+        )
+
+    def test_duplicate_nodes_mixed(self):
+        """
+        Ensures that when we copy nodes in a mixed way, a full copy happens
+        """
+        new_channel = testdata.channel()
+
+        # simulate a clean, right-after-publish state to ensure only new channel is marked as change
+        self.channel.main_tree.changed = False
+        self.channel.main_tree.save()
+        self.channel.main_tree.refresh_from_db()
+        self.assertFalse(self.channel.main_tree.changed)
+
+        new_channel.main_tree.changed = False
+        new_channel.main_tree.save()
+        new_channel.main_tree.refresh_from_db()
+        self.assertFalse(new_channel.main_tree.changed)
+
+        self.channel.main_tree.copy_to(new_channel.main_tree, batch_size=1000)
+
+        _check_node_copy(
+            self.channel.main_tree,
+            new_channel.main_tree.get_children().last(),
+            original_channel_id=self.channel.id,
+            channel=new_channel,
+        )
+        new_channel.main_tree.refresh_from_db()
+        self.assertTrue(new_channel.main_tree.changed)
+
+        self.channel.main_tree.refresh_from_db()
+        self.assertFalse(self.channel.main_tree.changed)
+
+    def test_duplicate_nodes_with_tags(self):
+        """
+        Ensures that when we copy nodes with tags they get copied
+        """
+        new_channel = testdata.channel()
+
+        tree = TreeBuilder(tags=True)
+        self.channel.main_tree = tree.root
+        self.channel.save()
+
+        # Add a legacy tag with a set channel to test the tag copying behaviour.
+        legacy_tag = ContentTag.objects.create(tag_name="test", channel=self.channel)
+        # Add an identical tag without a set channel to make sure it gets reused.
+        ContentTag.objects.create(tag_name="test")
+
+        num_test_tags_before = ContentTag.objects.filter(tag_name="test").count()
+
+        self.channel.main_tree.get_children().first().tags.add(legacy_tag)
+
+        self.channel.main_tree.copy_to(new_channel.main_tree, batch_size=1000)
+
+        _check_node_copy(
+            self.channel.main_tree,
+            new_channel.main_tree.get_children().last(),
+            original_channel_id=self.channel.id,
+            channel=new_channel,
+        )
+
+        self.assertEqual(
+            num_test_tags_before, ContentTag.objects.filter(tag_name="test").count()
+        )
+
+    def test_duplicate_nodes_with_duplicate_tags(self):
+        """
+        Ensures that when we copy nodes with duplicated tags they get copied
+        """
+        new_channel = testdata.channel()
+
+        tree = TreeBuilder(tags=True)
+        self.channel.main_tree = tree.root
+        self.channel.save()
+
+        # Add a legacy tag with a set channel to test the tag copying behaviour.
+        legacy_tag = ContentTag.objects.create(tag_name="test", channel=self.channel)
+        # Add an identical tag without a set channel to make sure it gets reused.
+        identical_tag = ContentTag.objects.create(tag_name="test")
+
+        num_test_tags_before = ContentTag.objects.filter(tag_name="test").count()
+
+        # Add both the legacy and the new style tag and ensure that it doesn't break.
+        self.channel.main_tree.get_children().first().tags.add(legacy_tag)
+        self.channel.main_tree.get_children().first().tags.add(identical_tag)
+
+        self.channel.main_tree.copy_to(new_channel.main_tree, batch_size=1000)
+
+        _check_node_copy(
+            self.channel.main_tree,
+            new_channel.main_tree.get_children().last(),
+            original_channel_id=self.channel.id,
+            channel=new_channel,
+        )
+
+        self.assertEqual(
+            num_test_tags_before, ContentTag.objects.filter(tag_name="test").count()
+        )
+
+    def test_duplicate_nodes_deep(self):
+        """
+        Ensures that when we copy nodes in a deep way, a full copy happens
+        """
+        new_channel = testdata.channel()
+
+        # simulate a clean, right-after-publish state to ensure only new channel is marked as change
+        self.channel.main_tree.changed = False
+        self.channel.main_tree.save()
+        self.channel.main_tree.refresh_from_db()
+        self.assertFalse(self.channel.main_tree.changed)
+
+        new_channel.main_tree.changed = False
+        new_channel.main_tree.save()
+        new_channel.main_tree.refresh_from_db()
+        self.assertFalse(new_channel.main_tree.changed)
+
+        self.channel.main_tree.copy_to(new_channel.main_tree, batch_size=10000)
+
+        _check_node_copy(
+            self.channel.main_tree,
+            new_channel.main_tree.get_children().last(),
+            original_channel_id=self.channel.id,
+            channel=new_channel,
+        )
+        new_channel.main_tree.refresh_from_db()
+        self.assertTrue(new_channel.main_tree.changed)
+
+        self.channel.main_tree.refresh_from_db()
+        self.assertFalse(self.channel.main_tree.changed)
+
+    def test_duplicate_nodes_deep_refreshes(self):
+        """
+        Ensures that when we copy nodes in a shallow way, target nodes get refreshed
+        """
+        new_channel = testdata.channel()
+
+        new_channel.main_tree.copy_to(self.channel.main_tree, batch_size=10000)
+
+        new_channel.main_tree.copy_to(
+            self.channel.main_tree.get_children().first(), batch_size=10000
+        )
+
+        new_channel.main_tree.copy_to(self.channel.main_tree, batch_size=10000)
+
+        last_rght = None
+
+        for new_node in self.channel.main_tree.get_children():
+            # All the new nodes should be immediate siblings, so their
+            # lft and rght values should be an incrementing sequence
+            if last_rght is not None:
+                self.assertEqual(last_rght + 1, new_node.lft)
+            last_rght = new_node.rght
+
+    def test_duplicate_nodes_with_changes(self):
+        """
+        Ensures that when we copy nodes, we can apply additional changes to the nodes
+        during the copy - primarily used for setting a new title at copy
+        """
+        new_channel = testdata.channel()
+
+        # simulate a clean, right-after-publish state to ensure only new channel is marked as change
+        self.channel.main_tree.changed = False
+        self.channel.main_tree.save()
+        self.channel.main_tree.refresh_from_db()
+
+        new_title = "this should be different"
+
+        copy = self.channel.main_tree.copy_to(
+            new_channel.main_tree, mods={"title": new_title}
+        )
+
+        self.assertEqual(copy.title, new_title)
+
+    def test_duplicate_nodes_with_excluded_descendants(self):
+        """
+        Ensures that when we copy nodes, we can exclude nodes from the descendant
+        hierarchy
+        """
+        new_channel = testdata.channel()
+
+        # simulate a clean, right-after-publish state to ensure only new channel is marked as change
+        self.channel.main_tree.changed = False
+        self.channel.main_tree.save()
+
+        excluded_node_id = self.channel.main_tree.get_children().first().node_id
+
+        self.channel.main_tree.copy_to(
+            new_channel.main_tree, excluded_descendants={excluded_node_id: True}
+        )
+
+        self.assertEqual(
+            new_channel.main_tree.get_children().last().get_children().count(),
+            self.channel.main_tree.get_children().count() - 1,
+        )
+
+    def test_duplicate_nodes_freeze_authoring_data_no_edit(self):
+        """
+        Ensures that when we copy nodes, we can exclude nodes from the descendant
+        hierarchy
+        """
+        new_channel = testdata.channel()
+
+        # simulate a clean, right-after-publish state to ensure only new channel is marked as change
+        self.channel.main_tree.changed = False
+        self.channel.main_tree.freeze_authoring_data = False
+        self.channel.main_tree.save()
+
+        self.channel.main_tree.copy_to(
+            new_channel.main_tree, can_edit_source_channel=False
+        )
+
+        self.assertTrue(
+            new_channel.main_tree.get_children().last().freeze_authoring_data
+        )
+
+    def test_duplicate_nodes_no_freeze_authoring_data_edit(self):
+        """
+        Ensures that when we copy nodes, we can modify fields if they are not frozen for editing
+        """
+        new_channel = testdata.channel()
+
+        # simulate a clean, right-after-publish state to ensure only new channel is marked as change
+        self.channel.main_tree.changed = False
+        self.channel.main_tree.freeze_authoring_data = False
+        self.channel.main_tree.save()
+
+        self.channel.main_tree.copy_to(
+            new_channel.main_tree, can_edit_source_channel=True
+        )
+
+        self.assertFalse(
+            new_channel.main_tree.get_children().last().freeze_authoring_data
+        )
+
+    def test_duplicate_nodes_freeze_authoring_data_edit(self):
+        """
+        Ensures that when we copy nodes, we can't modify fields if they are frozen for editing
+        """
+        new_channel = testdata.channel()
+
+        # simulate a clean, right-after-publish state to ensure only new channel is marked as change
+        self.channel.main_tree.changed = False
+        self.channel.main_tree.freeze_authoring_data = True
+        self.channel.main_tree.save()
+
+        self.channel.main_tree.copy_to(
+            new_channel.main_tree, can_edit_source_channel=True
+        )
+
+        self.assertTrue(
+            new_channel.main_tree.get_children().last().freeze_authoring_data
+        )
+
+    def test_duplicate_nodes_with_assessment_item_file(self):
+        """
+        Ensures that when we copy nodes with tags they get copied
+        """
+        new_channel = testdata.channel()
+
+        tree = TreeBuilder(tags=True)
+        self.channel.main_tree = tree.root
+        self.channel.save()
+
+        exercise = (
+            self.channel.main_tree.get_descendants()
+            .filter(kind_id=content_kinds.EXERCISE)
+            .first()
+        )
+
+        ai = exercise.assessment_items.first()
+
+        file = testdata.fileobj_exercise_image()
+
+        file.assessment_item = ai
+        file.save()
+
+        self.channel.main_tree.copy_to(new_channel.main_tree, batch_size=1000)
+
+        _check_node_copy(
+            self.channel.main_tree,
+            new_channel.main_tree.get_children().last(),
+            original_channel_id=self.channel.id,
+            channel=new_channel,
+        )
+
+    def test_multiple_copy_channel_ids(self):
+        """
+        This test ensures that as we copy nodes across various channels, that their original_channel_id and
+        source_channel_id values are properly updated.
+        """
+
+        channels = [
+            self.channel,
+            testdata.channel(),
+            testdata.channel(),
+            testdata.channel(),
+            testdata.channel(),
+        ]
+
+        copy_node_root = self.channel.main_tree.get_children().first()
+        for i in range(1, len(channels)):
+            print("Copying channel {} nodes to channel {}".format(i - 1, i))
+            channel = channels[i]
+            prev_channel = channels[i - 1]
+
+            prev_channel.main_tree.changed = False
+            prev_channel.main_tree.save()
+            prev_channel.main_tree.refresh_from_db()
+            self.assertFalse(prev_channel.main_tree.changed)
+
+            # simulate a clean, right-after-publish state to ensure only new channel
+            # is marked as change
+            channel.main_tree.changed = False
+            channel.main_tree.save()
+            channel.main_tree.refresh_from_db()
+            self.assertFalse(channel.main_tree.changed)
+
+            # make sure we always copy the copy we made in the previous go around :)
+            copy_node_root.copy_to(channel.main_tree)
+
+            old_copy_node_root = copy_node_root
+
+            copy_node_root = channel.main_tree.get_children().last()
+
+            _check_node_copy(
+                old_copy_node_root,
+                copy_node_root,
+                original_channel_id=self.channel.id,
+                channel=channel,
+            )
+            channel.main_tree.refresh_from_db()
+            self.assertTrue(channel.main_tree.changed)
+            self.assertTrue(
+                channel.main_tree.get_descendants().filter(changed=True).exists()
+            )
+
+            prev_channel.main_tree.refresh_from_db()
+            self.assertFalse(prev_channel.main_tree.changed)
+
+    def test_move_nodes(self):
+        """
+        Ensures that moving nodes properly removes them from the original parent
+        and adds them to the new one, and marks the new and old parents as changed,
+        and that the node channel info gets updated as well.
+        """
+        title = "A Node on the Move"
+        topic, _created = ContentKind.objects.get_or_create(kind="Topic")
+        self.channel.main_tree = ContentNode.objects.create(title="Heyo!", kind=topic)
+        self.channel.save()
+        _create_nodes(10, title, parent=self.channel.main_tree)
+
+        self.assertEqual(self.channel.main_tree.get_descendant_count(), 10)
+        self.assertTrue(self.channel.main_tree.changed)
+        self.assertIsNone(self.channel.main_tree.parent)
+
+        _check_nodes(
+            self.channel.main_tree,
+            title,
+            original_channel_id=None,
+            source_channel_id=None,
+            channel=self.channel,
+        )
+
+        new_channel = testdata.channel()
+        new_channel.editors.add(self.user)
+        new_channel.main_tree.get_children().delete()
+        new_channel_node_count = new_channel.main_tree.get_descendants().count()
+
+        # simulate a clean, right-after-publish state for both trees to ensure they are marked
+        # changed after this
+        self.channel.main_tree.changed = False
+        self.channel.main_tree.save()
+        new_channel.main_tree.changed = False
+        new_channel.main_tree.save()
+
+        for node in self.channel.main_tree.get_children():
+            node.move_to(new_channel.main_tree)
+
+        self.channel.main_tree.refresh_from_db()
+        new_channel.main_tree.refresh_from_db()
+
+        # these can get out of sync if we don't do a rebuild
+        self.assertEqual(
+            self.channel.main_tree.get_descendants().count(),
+            self.channel.main_tree.get_descendant_count(),
+        )
+
+        self.assertNotEqual(self.channel.main_tree, new_channel.main_tree)
+        self.assertTrue(self.channel.main_tree.changed)
+        self.assertTrue(new_channel.main_tree.changed)
+
+        assert self.channel.main_tree.get_descendant_count() == 0
+        if new_channel.main_tree.get_descendants().count() > 10:
+
+            def recursive_print(node, indent=0):
+                for child in node.get_children():
+                    print("{}Node: {}".format(" " * indent, child.title))
+                    recursive_print(child, indent + 4)
+
+            recursive_print(new_channel.main_tree)
+
+        self.assertEqual(
+            new_channel.main_tree.get_descendants().count(), new_channel_node_count + 10
+        )
+
+        self.assertFalse(
+            self.channel.main_tree.get_descendants().filter(changed=True).exists()
+        )
+        self.assertTrue(
+            new_channel.main_tree.get_descendants().filter(changed=True).exists()
+        )
+
+        # The newly created node still has None for its original channel and source channel,
+        # as it has been moved, not duplicated.
+        _check_nodes(
+            new_channel.main_tree,
+            title=title,
+            original_channel_id=None,
+            source_channel_id=None,
+            channel=new_channel,
+        )
+
+
+class SyncNodesOperationTestCase(StudioTestCase):
+    """
+    Checks that sync nodes updates properies.
+    """
+
+    def setUp(self):
+        super(SyncNodesOperationTestCase, self).setUpBase()
+
+    def test_sync_after_no_changes(self):
+        orig_video, cloned_video = self._setup_original_and_deriative_nodes()
+        sync_node(
+            cloned_video,
+            sync_titles_and_descriptions=True,
+            sync_resource_details=True,
+            sync_files=True,
+            sync_assessment_items=True,
+        )
+        self._assert_same_files(orig_video, cloned_video)
+
+    def test_sync_but_incomplete(self):
+        orig_video, cloned_video = self._setup_original_and_deriative_nodes()
+        orig_video.license_id = None
+        orig_video.mark_complete()
+        self.assertFalse(orig_video.complete)
+        orig_video.save()
+
+        self.assertTrue(cloned_video.complete)
+
+        sync_node(
+            cloned_video,
+            sync_titles_and_descriptions=True,
+            sync_resource_details=True,
+            sync_files=True,
+            sync_assessment_items=True,
+        )
+
+        self.assertIsNotNone(cloned_video.license_id)
+        cloned_video.mark_complete()
+        self.assertTrue(cloned_video.complete)
+
+    def test_sync_with_subs(self):
+        orig_video, cloned_video = self._setup_original_and_deriative_nodes()
+        self._add_subs_to_video_node(orig_video, "fr")
+        self._add_subs_to_video_node(orig_video, "es")
+        self._add_subs_to_video_node(orig_video, "en")
+        sync_node(
+            cloned_video,
+            sync_titles_and_descriptions=True,
+            sync_resource_details=True,
+            sync_files=True,
+            sync_assessment_items=True,
+        )
+        self._assert_same_files(orig_video, cloned_video)
+
+    def test_resync_after_more_subs_added(self):
+        orig_video, cloned_video = self._setup_original_and_deriative_nodes()
+        self._add_subs_to_video_node(orig_video, "fr")
+        self._add_subs_to_video_node(orig_video, "es")
+        self._add_subs_to_video_node(orig_video, "en")
+        sync_node(
+            cloned_video,
+            sync_titles_and_descriptions=True,
+            sync_resource_details=True,
+            sync_files=True,
+            sync_assessment_items=True,
+        )
+        self._add_subs_to_video_node(orig_video, "ar")
+        self._add_subs_to_video_node(orig_video, "zul")
+        sync_node(
+            cloned_video,
+            sync_titles_and_descriptions=True,
+            sync_resource_details=True,
+            sync_files=True,
+            sync_assessment_items=True,
+        )
+        self._assert_same_files(orig_video, cloned_video)
+
+    def _create_video_node(self, title, parent, withsubs=False):
+        data = dict(
+            kind_id="video",
+            title=title,
+            node_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        video_node = testdata.node(data, parent=parent)
+        video_node.license_id = 9  # Special Permissions
+        video_node.license_description = "Special permissions for testing"
+        video_node.copyright_holder = "LE"
+        # ensure the node is complete according to our logic
+        video_node.mark_complete()
+        self.assertTrue(video_node.complete)
+        video_node.save()
+
+        if withsubs:
+            self._add_subs_to_video_node(video_node, "fr")
+            self._add_subs_to_video_node(video_node, "es")
+            self._add_subs_to_video_node(video_node, "en")
+
+        return video_node
+
+    def _add_subs_to_video_node(self, video_node, lang):
+        lang_obj = Language.objects.get(id=lang)
+        sub_file = create_studio_file(
+            "subsin" + lang, preset="video_subtitle", ext="vtt"
+        )["db_file"]
+        sub_file.language = lang_obj
+        sub_file.contentnode = video_node
+        sub_file.save()
+
+    def _create_empty_tree(self):
+        topic_kind = ContentKind.objects.get(kind="topic")
+        root_node = ContentNode.objects.create(
+            title="Le derivative root", kind=topic_kind
+        )
+        return root_node
+
+    def _create_minimal_tree(self, withsubs=False):
+        topic_kind = ContentKind.objects.get(kind="topic")
+        root_node = ContentNode.objects.create(title="Le root", kind=topic_kind)
+        self._create_video_node(
+            title="Sample video", parent=root_node, withsubs=withsubs
+        )
+        return root_node
+
+    def _setup_original_and_deriative_nodes(self):
+        # Setup original channel
+        self.channel = (
+            testdata.channel()
+        )  # done in base class but doesn't hurt to do again...
+        self.channel.main_tree = self._create_minimal_tree(withsubs=False)
+        self.channel.save()
+
+        # Setup derivative channel
+        self.new_channel = Channel.objects.create(
+            name="derivative of teschannel",
+            source_id="lkajs",
+            actor_id=self.admin_user.id,
+        )
+        self.new_channel.save()
+        self.new_channel.main_tree = self._create_empty_tree()
+        self.new_channel.main_tree.save()
+        new_tree = self.channel.main_tree.copy()
+        self.new_channel.main_tree = new_tree
+        self.new_channel.main_tree.refresh_from_db()
+
+        # Return video nodes we need for this test
+        orig_video = self.channel.main_tree.children.all()[0]
+        cloned_video = self.new_channel.main_tree.children.all()[0]
+        return orig_video, cloned_video
+
+    def _assert_same_files(self, nodeA, nodeB):
+        filesA = nodeA.files.all().order_by("checksum")
+        filesB = nodeB.files.all().order_by("checksum")
+        assert len(filesA) == len(filesB), "different number of files found"
+        for fileA, fileB in zip(filesA, filesB):
+            assert fileA.checksum == fileB.checksum, "different checksum found"
+            assert fileA.preset == fileB.preset, "different preset found"
+            assert fileA.language == fileB.language, "different language found"
+
+
+class NodeCreationTestCase(StudioTestCase):
+    def setUp(self):
+        return super(NodeCreationTestCase, self).setUpBase()
+
+    def test_content_tag_creation(self):
+        """
+        Verfies tag creation works
+        """
+        mixer.blend(
+            ContentTag,
+            tag_name="".join(random.sample(string.printable, random.randint(31, 50))),
+        )
+        with self.assertRaises(DataError):
+            mixer.blend(
+                ContentTag,
+                tag_name=random.sample(string.printable, random.randint(51, 80)),
+            )
+
+    def test_create_node_null_complete(self):
+        new_obj = ContentNode(kind_id=content_kinds.TOPIC)
+        try:
+            new_obj.save()
+        except IntegrityError:
+            self.fail("Caused an IntegrityError")
+
+
+class NodeCompletionTestCase(StudioTestCase):
+
+    old_extra_fields = {
+        "mastery_model": exercises.M_OF_N,
+        "randomize": False,
+        "m": 3,
+        "n": 5,
+    }
+
+    new_extra_fields = {
+        "randomize": False,
+        "options": {
+            "completion_criteria": {
+                "threshold": {
+                    "mastery_model": exercises.M_OF_N,
+                    "m": 4,
+                    "n": 5,
+                },
+                "model": completion_criteria.MASTERY,
+            }
+        },
+    }
+
+    def setUp(self):
+        return super(NodeCompletionTestCase, self).setUpBase()
+
+    def test_create_topic_set_complete_no_parent(self):
+        new_obj = ContentNode(kind_id=content_kinds.TOPIC)
+        new_obj.save()
+        new_obj.mark_complete()
+        self.assertTrue(new_obj.complete)
+
+    def test_create_topic_set_complete_parent_no_title(self):
+        channel = testdata.channel()
+        new_obj = ContentNode(kind_id=content_kinds.TOPIC, parent=channel.main_tree)
+        new_obj.save()
+        new_obj.mark_complete()
+        self.assertFalse(new_obj.complete)
+
+    def test_create_topic_set_complete_parent_title(self):
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes", kind_id=content_kinds.TOPIC, parent=channel.main_tree
+        )
+        new_obj.save()
+        new_obj.mark_complete()
+        self.assertTrue(new_obj.complete)
+
+    def test_create_video_set_complete_no_license(self):
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes", kind_id=content_kinds.VIDEO, parent=channel.main_tree
+        )
+        new_obj.save()
+        File.objects.create(
+            contentnode=new_obj,
+            preset_id=format_presets.VIDEO_HIGH_RES,
+            checksum=uuid.uuid4().hex,
+        )
+        new_obj.mark_complete()
+        self.assertFalse(new_obj.complete)
+
+    def test_create_video_set_complete_custom_license_no_description(self):
+        custom_licenses = list(
+            License.objects.filter(is_custom=True).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.VIDEO,
+            parent=channel.main_tree,
+            license_id=custom_licenses[0],
+            copyright_holder="Some person",
+        )
+        new_obj.save()
+        File.objects.create(
+            contentnode=new_obj,
+            preset_id=format_presets.VIDEO_HIGH_RES,
+            checksum=uuid.uuid4().hex,
+        )
+        new_obj.mark_complete()
+        self.assertFalse(new_obj.complete)
+
+    def test_create_video_set_complete_custom_license_with_description(self):
+        custom_licenses = list(
+            License.objects.filter(is_custom=True).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.VIDEO,
+            parent=channel.main_tree,
+            license_id=custom_licenses[0],
+            license_description="don't do this!",
+            copyright_holder="Some person",
+        )
+        new_obj.save()
+        File.objects.create(
+            contentnode=new_obj,
+            preset_id=format_presets.VIDEO_HIGH_RES,
+            checksum=uuid.uuid4().hex,
+        )
+        new_obj.mark_complete()
+        self.assertTrue(new_obj.complete)
+
+    def test_create_video_set_complete_copyright_holder_required_no_copyright_holder(
+        self,
+    ):
+        required_holder = list(
+            License.objects.filter(
+                copyright_holder_required=True, is_custom=False
+            ).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.VIDEO,
+            parent=channel.main_tree,
+            license_id=required_holder[0],
+        )
+        new_obj.save()
+        File.objects.create(
+            contentnode=new_obj,
+            preset_id=format_presets.VIDEO_HIGH_RES,
+            checksum=uuid.uuid4().hex,
+        )
+        new_obj.mark_complete()
+        self.assertFalse(new_obj.complete)
+
+    def test_create_video_set_complete_copyright_holder_required_copyright_holder(self):
+        required_holder = list(
+            License.objects.filter(
+                copyright_holder_required=True, is_custom=False
+            ).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.VIDEO,
+            parent=channel.main_tree,
+            license_id=required_holder[0],
+            copyright_holder="Some person",
+        )
+        new_obj.save()
+        File.objects.create(
+            contentnode=new_obj,
+            preset_id=format_presets.VIDEO_HIGH_RES,
+            checksum=uuid.uuid4().hex,
+        )
+        new_obj.mark_complete()
+        self.assertTrue(new_obj.complete)
+
+    def test_create_video_no_files(self):
+        licenses = list(
+            License.objects.filter(
+                copyright_holder_required=False, is_custom=False
+            ).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.VIDEO,
+            parent=channel.main_tree,
+            license_id=licenses[0],
+        )
+        new_obj.save()
+        new_obj.mark_complete()
+        self.assertFalse(new_obj.complete)
+
+    def test_create_video_thumbnail_only(self):
+        licenses = list(
+            License.objects.filter(
+                copyright_holder_required=False, is_custom=False
+            ).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.VIDEO,
+            parent=channel.main_tree,
+            license_id=licenses[0],
+        )
+        new_obj.save()
+        File.objects.create(
+            contentnode=new_obj,
+            preset_id=format_presets.VIDEO_THUMBNAIL,
+            checksum=uuid.uuid4().hex,
+        )
+        new_obj.mark_complete()
+        self.assertFalse(new_obj.complete)
+
+    def test_create_video_invalid_completion_criterion(self):
+        licenses = list(
+            License.objects.filter(
+                copyright_holder_required=False, is_custom=False
+            ).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.VIDEO,
+            parent=channel.main_tree,
+            license_id=licenses[0],
+            copyright_holder="Some person",
+            extra_fields={
+                "randomize": False,
+                "options": {
+                    "completion_criteria": {
+                        "threshold": {
+                            "mastery_model": exercises.M_OF_N,
+                            "n": 5,
+                        },
+                        "model": completion_criteria.MASTERY,
+                    }
+                },
+            },
+        )
+        new_obj.save()
+        File.objects.create(
+            contentnode=new_obj,
+            preset_id=format_presets.VIDEO_HIGH_RES,
+            checksum=uuid.uuid4().hex,
+        )
+        new_obj.mark_complete()
+        self.assertFalse(new_obj.complete)
+
+    def test_create_exercise_no_assessment_items(self):
+        licenses = list(
+            License.objects.filter(
+                copyright_holder_required=False, is_custom=False
+            ).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.EXERCISE,
+            parent=channel.main_tree,
+            license_id=licenses[0],
+            extra_fields=self.new_extra_fields,
+        )
+        new_obj.save()
+        new_obj.mark_complete()
+        self.assertFalse(new_obj.complete)
+
+    def test_create_exercise_invalid_assessment_item_no_question(self):
+        licenses = list(
+            License.objects.filter(
+                copyright_holder_required=False, is_custom=False
+            ).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.EXERCISE,
+            parent=channel.main_tree,
+            license_id=licenses[0],
+            extra_fields=self.new_extra_fields,
+        )
+        new_obj.save()
+        AssessmentItem.objects.create(
+            contentnode=new_obj, answers='[{"correct": true, "text": "answer"}]'
+        )
+        new_obj.mark_complete()
+        self.assertFalse(new_obj.complete)
+
+    def test_create_exercise_invalid_assessment_item_no_answers(self):
+        licenses = list(
+            License.objects.filter(
+                copyright_holder_required=False, is_custom=False
+            ).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.EXERCISE,
+            parent=channel.main_tree,
+            license_id=licenses[0],
+            extra_fields=self.new_extra_fields,
+        )
+        new_obj.save()
+        AssessmentItem.objects.create(
+            contentnode=new_obj, question="This is a question"
+        )
+        new_obj.mark_complete()
+        self.assertFalse(new_obj.complete)
+
+    def test_create_exercise_valid_assessment_item_free_response_no_answers(self):
+        licenses = list(
+            License.objects.filter(
+                copyright_holder_required=False, is_custom=False
+            ).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.EXERCISE,
+            parent=channel.main_tree,
+            license_id=licenses[0],
+            extra_fields=self.new_extra_fields,
+        )
+        new_obj.save()
+        AssessmentItem.objects.create(
+            contentnode=new_obj,
+            question="This is a question",
+            type=exercises.FREE_RESPONSE,
+        )
+        new_obj.mark_complete()
+        self.assertTrue(new_obj.complete)
+
+    def test_create_exercise_invalid_assessment_item_no_correct_answers(self):
+        licenses = list(
+            License.objects.filter(
+                copyright_holder_required=False, is_custom=False
+            ).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.EXERCISE,
+            parent=channel.main_tree,
+            license_id=licenses[0],
+            extra_fields=self.new_extra_fields,
+        )
+        new_obj.save()
+        AssessmentItem.objects.create(
+            contentnode=new_obj,
+            question="This is a question",
+            answers='[{"correct": false, "text": "answer"}]',
+        )
+        new_obj.mark_complete()
+        self.assertFalse(new_obj.complete)
+
+    def test_create_exercise_valid_assessment_item_no_correct_answers_input(self):
+        licenses = list(
+            License.objects.filter(
+                copyright_holder_required=False, is_custom=False
+            ).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.EXERCISE,
+            parent=channel.main_tree,
+            license_id=licenses[0],
+            extra_fields=self.new_extra_fields,
+        )
+        new_obj.save()
+        AssessmentItem.objects.create(
+            contentnode=new_obj,
+            question="This is a question",
+            answers='[{"correct": false, "text": "answer"}]',
+            type=exercises.INPUT_QUESTION,
+        )
+        new_obj.mark_complete()
+        self.assertTrue(new_obj.complete)
+
+    def test_create_exercise_valid_assessment_item_true_false(self):
+        licenses = list(
+            License.objects.filter(
+                copyright_holder_required=False, is_custom=False
+            ).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.EXERCISE,
+            parent=channel.main_tree,
+            license_id=licenses[0],
+            extra_fields=self.new_extra_fields,
+        )
+        new_obj.save()
+        AssessmentItem.objects.create(
+            contentnode=new_obj,
+            question="True?",
+            answers='[{"answer":"True","correct":true,"order":1},{"answer":"False","correct":false,"order":2}]',
+            type="true_false",
+        )
+        new_obj.mark_complete()
+        self.assertTrue(new_obj.complete)
+
+    def test_create_exercise_valid_assessment_items(self):
+        licenses = list(
+            License.objects.filter(
+                copyright_holder_required=False, is_custom=False
+            ).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.EXERCISE,
+            parent=channel.main_tree,
+            license_id=licenses[0],
+            extra_fields=self.new_extra_fields,
+        )
+        new_obj.save()
+        AssessmentItem.objects.create(
+            contentnode=new_obj,
+            question="This is a question",
+            answers='[{"correct": true, "text": "answer"}]',
+        )
+        new_obj.mark_complete()
+        self.assertTrue(new_obj.complete)
+
+    def test_create_exercise_valid_assessment_items_raw_data(self):
+        licenses = list(
+            License.objects.filter(
+                copyright_holder_required=False, is_custom=False
+            ).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.EXERCISE,
+            parent=channel.main_tree,
+            license_id=licenses[0],
+            extra_fields=self.new_extra_fields,
+        )
+        new_obj.save()
+        AssessmentItem.objects.create(contentnode=new_obj, raw_data='{"question": {}}')
+        new_obj.mark_complete()
+        self.assertTrue(new_obj.complete)
+
+    def test_create_exercise_no_extra_fields(self):
+        licenses = list(
+            License.objects.filter(
+                copyright_holder_required=False, is_custom=False
+            ).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.EXERCISE,
+            parent=channel.main_tree,
+            license_id=licenses[0],
+        )
+        new_obj.save()
+        AssessmentItem.objects.create(
+            contentnode=new_obj,
+            question="This is a question",
+            answers='[{"correct": true, "text": "answer"}]',
+        )
+        new_obj.mark_complete()
+        self.assertFalse(new_obj.complete)
+
+    def test_create_exercise_old_extra_fields(self):
+        licenses = list(
+            License.objects.filter(
+                copyright_holder_required=False, is_custom=False
+            ).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.EXERCISE,
+            parent=channel.main_tree,
+            license_id=licenses[0],
+            extra_fields=self.old_extra_fields,
+        )
+        new_obj.save()
+        AssessmentItem.objects.create(
+            contentnode=new_obj,
+            question="This is a question",
+            answers='[{"correct": true, "text": "answer"}]',
+        )
+        new_obj.mark_complete()
+        self.assertTrue(new_obj.complete)
+
+    def test_migrate_extra_fields_do_all_with_non_null_m_n(self):
+        """Migrated do_all exercises with non-null m/n must pass completion criteria validation."""
+        extra_fields = {
+            "mastery_model": exercises.DO_ALL,
+            "m": 0,
+            "n": 0,
+            "randomize": False,
+        }
+        result = migrate_extra_fields(extra_fields)
+        criterion = result["options"]["completion_criteria"]
+        # Should not raise
+        studio_completion_criteria.validate(criterion, kind=content_kinds.EXERCISE)
+
+    def test_migrate_extra_fields_num_correct_in_a_row_with_non_null_m_n(self):
+        """Migrated num_correct_in_a_row exercises with leftover m/n must pass validation."""
+        for mastery_model in (
+            exercises.NUM_CORRECT_IN_A_ROW_2,
+            exercises.NUM_CORRECT_IN_A_ROW_3,
+            exercises.NUM_CORRECT_IN_A_ROW_5,
+            exercises.NUM_CORRECT_IN_A_ROW_10,
+        ):
+            extra_fields = {
+                "mastery_model": mastery_model,
+                "m": 5,
+                "n": 10,
+                "randomize": False,
+            }
+            result = migrate_extra_fields(extra_fields)
+            criterion = result["options"]["completion_criteria"]
+            # Should not raise
+            studio_completion_criteria.validate(criterion, kind=content_kinds.EXERCISE)
+
+    def test_migrate_extra_fields_m_of_n_preserves_m_n(self):
+        """Migrated m_of_n exercises must preserve m and n values."""
+        extra_fields = {
+            "mastery_model": exercises.M_OF_N,
+            "m": 3,
+            "n": 5,
+            "randomize": False,
+        }
+        result = migrate_extra_fields(extra_fields)
+        criterion = result["options"]["completion_criteria"]
+        self.assertEqual(criterion["threshold"]["m"], 3)
+        self.assertEqual(criterion["threshold"]["n"], 5)
+        # Should not raise
+        studio_completion_criteria.validate(criterion, kind=content_kinds.EXERCISE)
+
+    def test_create_exercise_bad_new_extra_fields(self):
+        licenses = list(
+            License.objects.filter(
+                copyright_holder_required=False, is_custom=False
+            ).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.EXERCISE,
+            parent=channel.main_tree,
+            license_id=licenses[0],
+            extra_fields={
+                "randomize": False,
+                "options": {
+                    "completion_criteria": {
+                        "threshold": {
+                            "mastery_model": exercises.M_OF_N,
+                            "n": 5,
+                        },
+                        "model": completion_criteria.MASTERY,
+                    }
+                },
+            },
+        )
+        new_obj.save()
+        AssessmentItem.objects.create(
+            contentnode=new_obj,
+            question="This is a question",
+            answers='[{"correct": true, "text": "answer"}]',
+        )
+        new_obj.mark_complete()
+        self.assertFalse(new_obj.complete)
+
+    def test_create_video_null_extra_fields(self):
+        licenses = list(
+            License.objects.filter(
+                copyright_holder_required=False, is_custom=False
+            ).values_list("pk", flat=True)
+        )
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="yes",
+            kind_id=content_kinds.VIDEO,
+            parent=channel.main_tree,
+            license_id=licenses[0],
+            copyright_holder="Some person",
+            extra_fields=None,
+        )
+        new_obj.save()
+        File.objects.create(
+            contentnode=new_obj,
+            preset_id=format_presets.VIDEO_HIGH_RES,
+            checksum=uuid.uuid4().hex,
+        )
+        try:
+            new_obj.mark_complete()
+        except AttributeError:
+            self.fail("Null extra_fields not handled")
+
+    def _make_preposttest_extra_fields(self, modality):
+        """Helper to create extra_fields with valid pre_post_test completion criteria."""
+        uuid_a = "a" * 32
+        uuid_b = "b" * 32
+        return {
+            "options": {
+                "modality": modality,
+                "completion_criteria": {
+                    "model": completion_criteria.MASTERY,
+                    "threshold": {
+                        "mastery_model": exercises.PRE_POST_TEST,
+                        "pre_post_test": {
+                            "assessment_item_ids": [uuid_a, uuid_b],
+                            "version_a_item_ids": [uuid_a],
+                            "version_b_item_ids": [uuid_b],
+                        },
+                    },
+                },
+            }
+        }
+
+    def test_create_topic_unit_modality_valid_preposttest_complete(self):
+        """Topic with UNIT modality and valid PRE_POST_TEST completion criteria should be complete."""
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="Unit Topic",
+            kind_id=content_kinds.TOPIC,
+            parent=channel.main_tree,
+            extra_fields=self._make_preposttest_extra_fields(modalities.UNIT),
+        )
+        new_obj.save()
+        new_obj.mark_complete()
+        self.assertTrue(new_obj.complete)
+
+    def test_create_topic_unit_modality_wrong_mastery_model_incomplete(self):
+        """Topic with UNIT modality but M_OF_N mastery model should be incomplete."""
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="Unit Topic",
+            kind_id=content_kinds.TOPIC,
+            parent=channel.main_tree,
+            extra_fields={
+                "options": {
+                    "modality": modalities.UNIT,
+                    "completion_criteria": {
+                        "model": completion_criteria.MASTERY,
+                        "threshold": {
+                            "mastery_model": exercises.M_OF_N,
+                            "m": 3,
+                            "n": 5,
+                        },
+                    },
+                }
+            },
+        )
+        new_obj.save()
+        new_obj.mark_complete()
+        self.assertFalse(new_obj.complete)
+
+    def test_create_topic_lesson_modality_with_completion_criteria_incomplete(self):
+        """Topic with LESSON modality should not have completion criteria."""
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="Lesson Topic",
+            kind_id=content_kinds.TOPIC,
+            parent=channel.main_tree,
+            extra_fields=self._make_preposttest_extra_fields(modalities.LESSON),
+        )
+        new_obj.save()
+        new_obj.mark_complete()
+        self.assertFalse(new_obj.complete)
+
+    def test_create_topic_no_modality_with_completion_criteria_incomplete(self):
+        """Topic with no modality should not have completion criteria."""
+        channel = testdata.channel()
+        extra_fields = self._make_preposttest_extra_fields(modalities.UNIT)
+        # Remove the modality
+        del extra_fields["options"]["modality"]
+        new_obj = ContentNode(
+            title="Topic Without Modality",
+            kind_id=content_kinds.TOPIC,
+            parent=channel.main_tree,
+            extra_fields=extra_fields,
+        )
+        new_obj.save()
+        new_obj.mark_complete()
+        self.assertFalse(new_obj.complete)
+
+    def test_create_topic_unit_modality_without_completion_criteria_incomplete(
+        self,
+    ):
+        """Topic with UNIT modality MUST have completion criteria - it's not optional."""
+        channel = testdata.channel()
+        new_obj = ContentNode(
+            title="Unit Topic Without Criteria",
+            kind_id=content_kinds.TOPIC,
+            parent=channel.main_tree,
+            extra_fields={
+                "options": {
+                    "modality": modalities.UNIT,
+                    # No completion_criteria
+                }
+            },
+        )
+        new_obj.save()
+        new_obj.mark_complete()
+        self.assertFalse(new_obj.complete)
+
+
+class FixExerciseExtraFieldsTestCase(StudioTestCase):
+    def setUp(self):
+        super(FixExerciseExtraFieldsTestCase, self).setUpBase()
+        self.licenses = list(
+            License.objects.filter(
+                copyright_holder_required=False, is_custom=False
+            ).values_list("pk", flat=True)
+        )
+        self.channel = testdata.channel()
+
+    def _create_exercise(self, extra_fields, with_assessment=True):
+        node = ContentNode(
+            title="Exercise",
+            kind_id=content_kinds.EXERCISE,
+            parent=self.channel.main_tree,
+            license_id=self.licenses[0],
+            extra_fields=extra_fields,
+        )
+        node.save()
+        if with_assessment:
+            AssessmentItem.objects.create(
+                contentnode=node,
+                question="A question",
+                answers='[{"correct": true, "text": "answer"}]',
+            )
+        return node
+
+    def test_fixes_migrated_do_all_with_non_null_m_n(self):
+        """Command should null out m/n for already-migrated do_all exercises."""
+        node = self._create_exercise(
+            {
+                "options": {
+                    "completion_criteria": {
+                        "threshold": {
+                            "mastery_model": exercises.DO_ALL,
+                            "m": 0,
+                            "n": 0,
+                        },
+                        "model": completion_criteria.MASTERY,
+                    }
+                },
+            }
+        )
+        node.mark_complete()
+        node.save()
+
+        command = FixExerciseExtraFieldsCommand()
+        command.handle()
+
+        node.refresh_from_db()
+        threshold = node.extra_fields["options"]["completion_criteria"]["threshold"]
+        self.assertIsNone(threshold["m"])
+        self.assertIsNone(threshold["n"])
+        self.assertEqual(threshold["mastery_model"], exercises.DO_ALL)
+        # Should now pass schema validation
+        studio_completion_criteria.validate(
+            node.extra_fields["options"]["completion_criteria"],
+            kind=content_kinds.EXERCISE,
+        )
+
+    def test_fixes_migrated_num_correct_in_a_row_with_non_null_m_n(self):
+        """Command should null out m/n for num_correct_in_a_row exercises."""
+        node = self._create_exercise(
+            {
+                "options": {
+                    "completion_criteria": {
+                        "threshold": {
+                            "mastery_model": exercises.NUM_CORRECT_IN_A_ROW_5,
+                            "m": 5,
+                            "n": 10,
+                        },
+                        "model": completion_criteria.MASTERY,
+                    }
+                },
+            }
+        )
+        node.mark_complete()
+        node.save()
+
+        command = FixExerciseExtraFieldsCommand()
+        command.handle()
+
+        node.refresh_from_db()
+        threshold = node.extra_fields["options"]["completion_criteria"]["threshold"]
+        self.assertIsNone(threshold["m"])
+        self.assertIsNone(threshold["n"])
+        self.assertEqual(threshold["mastery_model"], exercises.NUM_CORRECT_IN_A_ROW_5)
+
+    def test_does_not_touch_m_of_n(self):
+        """Command should leave m_of_n exercises untouched."""
+        node = self._create_exercise(
+            {
+                "options": {
+                    "completion_criteria": {
+                        "threshold": {
+                            "mastery_model": exercises.M_OF_N,
+                            "m": 3,
+                            "n": 5,
+                        },
+                        "model": completion_criteria.MASTERY,
+                    }
+                },
+            }
+        )
+        node.mark_complete()
+        node.save()
+
+        command = FixExerciseExtraFieldsCommand()
+        command.handle()
+
+        node.refresh_from_db()
+        threshold = node.extra_fields["options"]["completion_criteria"]["threshold"]
+        self.assertEqual(threshold["m"], 3)
+        self.assertEqual(threshold["n"], 5)
+
+    def test_migrates_old_style_extra_fields(self):
+        """Command should migrate old-style top-level mastery_model to new format."""
+        node = self._create_exercise(
+            {
+                "mastery_model": exercises.DO_ALL,
+                "m": 0,
+                "n": 0,
+                "randomize": False,
+            }
+        )
+
+        command = FixExerciseExtraFieldsCommand()
+        command.handle()
+
+        node.refresh_from_db()
+        # Should have new-style structure
+        criterion = node.extra_fields["options"]["completion_criteria"]
+        self.assertEqual(criterion["model"], completion_criteria.MASTERY)
+        self.assertEqual(criterion["threshold"]["mastery_model"], exercises.DO_ALL)
+        # m and n should be null for do_all
+        self.assertIsNone(criterion["threshold"]["m"])
+        self.assertIsNone(criterion["threshold"]["n"])
+        # Old keys should be gone
+        self.assertNotIn("mastery_model", node.extra_fields)
+        self.assertNotIn("m", node.extra_fields)
+        self.assertNotIn("n", node.extra_fields)
+        # randomize should be preserved
+        self.assertFalse(node.extra_fields["randomize"])
+
+    def test_dry_run_does_not_modify(self):
+        """Dry run should report counts but not modify data."""
+        node = self._create_exercise(
+            {
+                "options": {
+                    "completion_criteria": {
+                        "threshold": {
+                            "mastery_model": exercises.DO_ALL,
+                            "m": 0,
+                            "n": 0,
+                        },
+                        "model": completion_criteria.MASTERY,
+                    }
+                },
+            }
+        )
+        node.mark_complete()
+        node.save()
+
+        command = FixExerciseExtraFieldsCommand()
+        command.handle(dry_run=True)
+
+        node.refresh_from_db()
+        threshold = node.extra_fields["options"]["completion_criteria"]["threshold"]
+        # Should still have the invalid values
+        self.assertEqual(threshold["m"], 0)
+        self.assertEqual(threshold["n"], 0)
+
+    def test_incomplete_node_with_valid_fields_gets_marked_complete(self):
+        """An incomplete exercise with valid extra_fields should be marked complete."""
+        node = self._create_exercise(
+            {
+                "options": {
+                    "completion_criteria": {
+                        "threshold": {
+                            "mastery_model": exercises.DO_ALL,
+                            "m": None,
+                            "n": None,
+                        },
+                        "model": completion_criteria.MASTERY,
+                    }
+                },
+            }
+        )
+        # Force incomplete status even though fields are valid
+        node.complete = False
+        node.save()
+
+        command = FixExerciseExtraFieldsCommand()
+        command.handle()
+
+        node.refresh_from_db()
+        self.assertTrue(node.complete)
+
+    def test_migrates_string_extra_fields(self):
+        """Command should parse and migrate extra_fields stored as a JSON string."""
+        node = self._create_exercise(
+            json.dumps(
+                {
+                    "mastery_model": exercises.DO_ALL,
+                    "m": 0,
+                    "n": 0,
+                    "randomize": False,
+                }
+            ),
+        )
+
+        command = FixExerciseExtraFieldsCommand()
+        command.handle()
+
+        node.refresh_from_db()
+        extra_fields = node.extra_fields
+        # Should now be a dict, not a string
+        self.assertIsInstance(extra_fields, dict)
+        threshold = extra_fields["options"]["completion_criteria"]["threshold"]
+        self.assertIsNone(threshold["m"])
+        self.assertIsNone(threshold["n"])
+        self.assertEqual(threshold["mastery_model"], exercises.DO_ALL)
+        studio_completion_criteria.validate(
+            extra_fields["options"]["completion_criteria"],
+            kind=content_kinds.EXERCISE,
+        )
+
+
+class UnitCopyExtraFieldsTestCase(StudioTestCase):
+    def setUp(self):
+        super(UnitCopyExtraFieldsTestCase, self).setUpBase()
+        self.target_channel = testdata.channel()
+
+    # ------------------------------------------------------------------ #
+    # helpers
+    # ------------------------------------------------------------------ #
+
+    def _make_unit_extra_fields(self, lesson_ids):
+        """Return a full extra_fields dict for a UNIT topic."""
+        lo_id = "a" * 32
+        assessment_id = "b" * 32
+        options = {
+            "modality": modalities.UNIT,
+            "completion_criteria": {
+                "model": "mastery",
+                "threshold": {
+                    "mastery_model": "pre_post_test",
+                    "pre_post_test": {
+                        "assessment_item_ids": [assessment_id],
+                        "version_a_item_ids": [assessment_id],
+                        "version_b_item_ids": [assessment_id],
+                    },
+                },
+            },
+            "learning_objectives": [{"id": lo_id, "text": "Learn something"}],
+            "assessment_objectives": {assessment_id: [lo_id]},
+            "lesson_objectives": {lesson_id: [lo_id] for lesson_id in lesson_ids},
+        }
+        return {"options": options}
+
+    def _make_course_unit_lessons(self, num_lessons=2):
+        """
+        Build: channel.main_tree > course > unit > [lesson_1, lesson_2, ...]
+        Returns (course, unit, lessons).
+        unit.extra_fields is set after lesson nodes are created so it can reference their PKs.
+        """
+        course = ContentNode.objects.create(
+            title="Course",
+            kind_id=content_kinds.TOPIC,
+            parent=self.channel.main_tree,
+            extra_fields={"options": {"modality": modalities.COURSE}},
+        )
+        unit = ContentNode.objects.create(
+            title="Unit",
+            kind_id=content_kinds.TOPIC,
+            parent=course,
+        )
+        lessons = []
+        for i in range(num_lessons):
+            lesson = ContentNode.objects.create(
+                title="Lesson {}".format(i + 1),
+                kind_id=content_kinds.TOPIC,
+                parent=unit,
+                extra_fields={"options": {"modality": modalities.LESSON}},
+            )
+            lessons.append(lesson)
+
+        unit.extra_fields = self._make_unit_extra_fields(
+            lesson_ids=[lesson.id for lesson in lessons],
+        )
+        unit.save()
+        return course, unit, lessons
+
+    # ------------------------------------------------------------------ #
+    # deep-copy integration tests
+    # ------------------------------------------------------------------ #
+
+    def test_deep_copy_unit_remaps_lesson_objectives(self):
+        """Deep copy: lesson_objectives keys point at cloned lessons with correct LO values."""
+        course, unit, lessons = self._make_course_unit_lessons(num_lessons=2)
+        source_lesson_objectives = unit.extra_fields["options"]["lesson_objectives"]
+        course.copy_to(self.target_channel.main_tree, batch_size=10000)
+
+        copied_course = self.target_channel.main_tree.get_children().last()
+        copied_unit = copied_course.get_children().first()
+        copied_lessons = list(copied_unit.get_children().order_by("lft"))
+
+        copied_unit.refresh_from_db()
+        lesson_objectives = copied_unit.extra_fields["options"]["lesson_objectives"]
+
+        for original_lesson, copied_lesson in zip(lessons, copied_lessons):
+            self.assertIn(
+                copied_lesson.id,
+                lesson_objectives,
+                "Cloned lesson PK not found in lesson_objectives",
+            )
+            self.assertEqual(
+                lesson_objectives[copied_lesson.id],
+                source_lesson_objectives[original_lesson.id],
+            )
+        for original_lesson in lessons:
+            self.assertNotIn(
+                original_lesson.id,
+                lesson_objectives,
+                "Original lesson PK still present in lesson_objectives",
+            )
+
+    def test_deep_copy_non_unit_extra_fields_unchanged(self):
+        """Deep copy: extra_fields on Lesson and Course topics is copied verbatim."""
+        course, unit, lessons = self._make_course_unit_lessons(num_lessons=1)
+        course.copy_to(self.target_channel.main_tree, batch_size=10000)
+
+        copied_course = self.target_channel.main_tree.get_children().last()
+        copied_course.refresh_from_db()
+        copied_unit = copied_course.get_children().first()
+        copied_lesson = copied_unit.get_children().first()
+        copied_lesson.refresh_from_db()
+
+        self.assertEqual(copied_course.extra_fields, course.extra_fields)
+        self.assertEqual(copied_lesson.extra_fields, lessons[0].extra_fields)
+
+    # ------------------------------------------------------------------ #
+    # shallow-copy integration tests
+    # ------------------------------------------------------------------ #
+
+    def test_shallow_copy_unit_remaps_lesson_objectives(self):
+        """Shallow copy: lesson_objectives keys point at cloned lessons with correct LO values."""
+        course, unit, lessons = self._make_course_unit_lessons(num_lessons=2)
+        source_lesson_objectives = unit.extra_fields["options"]["lesson_objectives"]
+        course.copy_to(self.target_channel.main_tree, batch_size=1)
+
+        copied_course = self.target_channel.main_tree.get_children().last()
+        copied_unit = copied_course.get_children().first()
+        copied_lessons = list(copied_unit.get_children().order_by("lft"))
+
+        copied_unit.refresh_from_db()
+        lesson_objectives = copied_unit.extra_fields["options"]["lesson_objectives"]
+
+        for original_lesson, copied_lesson in zip(lessons, copied_lessons):
+            self.assertIn(copied_lesson.id, lesson_objectives)
+            self.assertEqual(
+                lesson_objectives[copied_lesson.id],
+                source_lesson_objectives[original_lesson.id],
+            )
+        for original_lesson in lessons:
+            self.assertNotIn(original_lesson.id, lesson_objectives)
+
+    def test_shallow_copy_non_unit_extra_fields_unchanged(self):
+        """Shallow copy: extra_fields on Lesson and Course topics is copied verbatim."""
+        course, unit, lessons = self._make_course_unit_lessons(num_lessons=1)
+        course.copy_to(self.target_channel.main_tree, batch_size=1)
+
+        copied_course = self.target_channel.main_tree.get_children().last()
+        copied_course.refresh_from_db()
+        copied_unit = copied_course.get_children().first()
+        copied_lesson = copied_unit.get_children().first()
+        copied_lesson.refresh_from_db()
+
+        self.assertEqual(copied_course.extra_fields, course.extra_fields)
+        self.assertEqual(copied_lesson.extra_fields, lessons[0].extra_fields)
+
+    # ------------------------------------------------------------------ #
+    # excluded_descendants masking tests
+    # ------------------------------------------------------------------ #
+
+    def test_excluded_lesson_entry_dropped_from_unit_deep(self):
+        """
+        Deep copy: when a lesson is excluded, its entry is dropped from
+        the cloned Unit's lesson_objectives.
+        """
+        course, unit, lessons = self._make_course_unit_lessons(num_lessons=2)
+        excluded_lesson = lessons[0]
+        kept_lesson = lessons[1]
+        source_lesson_objectives = unit.extra_fields["options"]["lesson_objectives"]
+
+        course.copy_to(
+            self.target_channel.main_tree,
+            batch_size=10000,
+            excluded_descendants={excluded_lesson.node_id: True},
+        )
+
+        copied_course = self.target_channel.main_tree.get_children().last()
+        copied_unit = copied_course.get_children().first()
+        copied_unit.refresh_from_db()
+        lesson_objectives = copied_unit.extra_fields["options"]["lesson_objectives"]
+
+        self.assertNotIn(excluded_lesson.id, lesson_objectives)
+        copied_kept = copied_unit.get_children().first()
+        self.assertIn(copied_kept.id, lesson_objectives)
+        self.assertEqual(
+            lesson_objectives[copied_kept.id],
+            source_lesson_objectives[kept_lesson.id],
+        )
+        self.assertEqual(len(lesson_objectives), 1)
+
+    def test_excluded_lesson_entry_dropped_from_unit_shallow(self):
+        """
+        Shallow copy: same behaviour as deep copy when a lesson is excluded.
+        """
+        course, unit, lessons = self._make_course_unit_lessons(num_lessons=2)
+        excluded_lesson = lessons[0]
+        kept_lesson = lessons[1]
+        source_lesson_objectives = unit.extra_fields["options"]["lesson_objectives"]
+
+        course.copy_to(
+            self.target_channel.main_tree,
+            batch_size=1,
+            excluded_descendants={excluded_lesson.node_id: True},
+        )
+
+        copied_course = self.target_channel.main_tree.get_children().last()
+        copied_unit = copied_course.get_children().first()
+        copied_unit.refresh_from_db()
+        lesson_objectives = copied_unit.extra_fields["options"]["lesson_objectives"]
+
+        self.assertNotIn(excluded_lesson.id, lesson_objectives)
+        copied_kept = copied_unit.get_children().first()
+        self.assertIn(copied_kept.id, lesson_objectives)
+        self.assertEqual(
+            lesson_objectives[copied_kept.id],
+            source_lesson_objectives[kept_lesson.id],
+        )
+        self.assertEqual(len(lesson_objectives), 1)
+
+    def test_excluded_unit_not_remapped(self):
+        """
+        Deep copy: when the Unit itself is excluded from a Course copy, the Unit is
+        absent from the clone and no remap runs (no error, Course copy succeeds).
+        """
+        course, unit, lessons = self._make_course_unit_lessons(num_lessons=2)
+
+        course.copy_to(
+            self.target_channel.main_tree,
+            batch_size=10000,
+            excluded_descendants={unit.node_id: True},
+        )
+
+        copied_course = self.target_channel.main_tree.get_children().last()
+        self.assertEqual(copied_course.get_children().count(), 0)
+
+    def test_excluded_resource_inside_lesson_preserves_lesson_entry(self):
+        """
+        Deep copy: when a resource inside a lesson is excluded (not the lesson
+        itself), the lesson's entry in lesson_objectives is preserved with the
+        cloned lesson's PK.
+        """
+        course, unit, lessons = self._make_course_unit_lessons(num_lessons=1)
+        lesson = lessons[0]
+        source_lesson_objectives = unit.extra_fields["options"]["lesson_objectives"]
+
+        license_obj = License.objects.filter(
+            copyright_holder_required=False, is_custom=False
+        ).first()
+        resource = ContentNode.objects.create(
+            title="Video",
+            kind_id=content_kinds.VIDEO,
+            parent=lesson,
+            license=license_obj,
+        )
+
+        course.copy_to(
+            self.target_channel.main_tree,
+            batch_size=10000,
+            excluded_descendants={resource.node_id: True},
+        )
+
+        copied_course = self.target_channel.main_tree.get_children().last()
+        copied_unit = copied_course.get_children().first()
+        copied_unit.refresh_from_db()
+        lesson_objectives = copied_unit.extra_fields["options"]["lesson_objectives"]
+
+        copied_lesson = copied_unit.get_children().first()
+        self.assertIn(copied_lesson.id, lesson_objectives)
+        self.assertNotIn(lesson.id, lesson_objectives)
+        self.assertEqual(
+            lesson_objectives[copied_lesson.id],
+            source_lesson_objectives[lesson.id],
+        )
+        self.assertEqual(len(lesson_objectives), 1)
+
+    def test_excluded_resource_inside_lesson_preserves_lesson_entry_shallow(self):
+        """
+        Shallow copy: when a resource inside a lesson is excluded (not the lesson
+        itself), the lesson's entry in lesson_objectives is preserved with the
+        cloned lesson's PK.
+        """
+        course, unit, lessons = self._make_course_unit_lessons(num_lessons=1)
+        lesson = lessons[0]
+        source_lesson_objectives = unit.extra_fields["options"]["lesson_objectives"]
+
+        license_obj = License.objects.filter(
+            copyright_holder_required=False, is_custom=False
+        ).first()
+        resource = ContentNode.objects.create(
+            title="Video",
+            kind_id=content_kinds.VIDEO,
+            parent=lesson,
+            license=license_obj,
+        )
+
+        course.copy_to(
+            self.target_channel.main_tree,
+            batch_size=1,
+            excluded_descendants={resource.node_id: True},
+        )
+
+        copied_course = self.target_channel.main_tree.get_children().last()
+        copied_unit = copied_course.get_children().first()
+        copied_unit.refresh_from_db()
+        lesson_objectives = copied_unit.extra_fields["options"]["lesson_objectives"]
+
+        copied_lesson = copied_unit.get_children().first()
+        self.assertIn(copied_lesson.id, lesson_objectives)
+        self.assertNotIn(lesson.id, lesson_objectives)
+        self.assertEqual(
+            lesson_objectives[copied_lesson.id],
+            source_lesson_objectives[lesson.id],
+        )
+        self.assertEqual(len(lesson_objectives), 1)
+
+    # ------------------------------------------------------------------ #
+    # regression and stability tests
+    # ------------------------------------------------------------------ #
+
+    def test_assessment_objectives_unchanged_after_copy(self):
+        """
+        assessment_objectives keys (assessment_ids) are not node PKs and must
+        be preserved verbatim on the cloned Unit.
+        """
+        course, unit, lessons = self._make_course_unit_lessons(num_lessons=1)
+        source_assessment_objectives = unit.extra_fields["options"][
+            "assessment_objectives"
+        ]
+
+        course.copy_to(self.target_channel.main_tree, batch_size=10000)
+
+        copied_course = self.target_channel.main_tree.get_children().last()
+        copied_unit = copied_course.get_children().first()
+        copied_unit.refresh_from_db()
+
+        self.assertEqual(
+            copied_unit.extra_fields["options"]["assessment_objectives"],
+            source_assessment_objectives,
+        )
+
+    def test_learning_objectives_list_unchanged_after_copy(self):
+        """
+        learning_objectives list (LO IDs, not node IDs) is preserved verbatim
+        on the cloned Unit.
+        """
+        course, unit, lessons = self._make_course_unit_lessons(num_lessons=1)
+        source_lo_list = unit.extra_fields["options"]["learning_objectives"]
+
+        course.copy_to(self.target_channel.main_tree, batch_size=10000)
+
+        copied_course = self.target_channel.main_tree.get_children().last()
+        copied_unit = copied_course.get_children().first()
+        copied_unit.refresh_from_db()
+
+        self.assertEqual(
+            copied_unit.extra_fields["options"]["learning_objectives"],
+            source_lo_list,
+        )
+
+    def test_completion_criteria_unchanged_after_copy(self):
+        """
+        completion_criteria (containing assessment_item_ids) is preserved
+        verbatim on the cloned Unit — assessment_ids are not node PKs.
+        """
+        course, unit, lessons = self._make_course_unit_lessons(num_lessons=1)
+        source_cc = unit.extra_fields["options"]["completion_criteria"]
+
+        course.copy_to(self.target_channel.main_tree, batch_size=10000)
+
+        copied_course = self.target_channel.main_tree.get_children().last()
+        copied_unit = copied_course.get_children().first()
+        copied_unit.refresh_from_db()
+
+        self.assertEqual(
+            copied_unit.extra_fields["options"]["completion_criteria"],
+            source_cc,
+        )

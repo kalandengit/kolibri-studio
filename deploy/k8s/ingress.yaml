@@ -1,0 +1,25 @@
+# Requires an ingress controller (e.g. ingress-nginx) and optionally cert-manager.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: studio
+  namespace: kolibri-studio
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "500m"
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: studio.example.com   # <- change me
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: studio-app
+                port:
+                  number: 80
+  # tls:
+  #   - hosts: [studio.example.com]
+  #     secretName: studio-tls

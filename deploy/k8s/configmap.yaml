@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: studio-config
+  namespace: kolibri-studio
+data:
+  # not_production_settings = no real emails, permissive ALLOWED_HOSTS (demo/staging).
+  # Use contentcuration.settings for real production.
+  DJANGO_SETTINGS_MODULE: "contentcuration.not_production_settings"
+  DATA_DB_HOST: "postgres"
+  DATA_DB_NAME: "kolibri-studio"
+  DATA_DB_USER: "learningequality"
+  CELERY_TIMEZONE: "UTC"
+  CELERY_REDIS_DB: "0"
+  CACHE_REDIS_DB: "1"
+  CELERY_BROKER_ENDPOINT: "redis"
+  CELERY_RESULT_BACKEND_ENDPOINT: "redis"
+  CELERY_REDIS_PASSWORD: ""
+  AWS_S3_ENDPOINT_URL: "http://minio:9000"
+  AWS_BUCKET_NAME: "content"
+  REMAP_SIGTERM: "SIGQUIT"
+  MPLBACKEND: "ps"
+  RUN_MODE: "kubernetes"

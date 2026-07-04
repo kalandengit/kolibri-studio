@@ -1,0 +1,16 @@
+{% load i18n %}
+
+{% autoescape off %}
+{% blocktrans with name=user.email %}Hello {{ name }},{% endblocktrans %}
+
+{% blocktrans with site_name=site.name %}You have requested a password reset on {{ site_name }} without first creating an account.{% endblocktrans %}
+
+{% translate "Please create an account by following the link below:" %}:
+
+{{ domain }}{% url 'accounts' %}#/create?email={{user.email}}
+
+{% translate "Thanks for using Kolibri Studio!" %}
+
+{% translate "The Learning Equality Team" %}
+
+{% endautoescape %}

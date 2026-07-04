@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: studio-app
+  namespace: kolibri-studio
+spec:
+  selector:
+    app: studio-app
+  ports:
+    - port: 80
+      targetPort: 8081
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: studio-app
+  namespace: kolibri-studio
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: studio-app
+  template:
+    metadata:
+      labels:
+        app: studio-app
+    spec:
+      containers:
+        - name: studio-app
+          # Build and push first (see deploy/k8s/README.md):
+          #   docker build -t <registry>/studio-app-prod:latest -f docker/Dockerfile.prod .
+          image: learningequality/studio-app-prod:latest
+          # Default image entrypoint is `make altprodserver` (gunicorn :8081)
+          ports:
+            - containerPort: 8081
+          envFrom:
+            - configMapRef:
+                name: studio-config
+            - secretRef:
+                name: studio-secrets
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              memory: 2Gi

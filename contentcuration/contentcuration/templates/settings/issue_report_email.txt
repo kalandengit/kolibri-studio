@@ -1,0 +1,28 @@
+{% load i18n %}
+
+{% autoescape off %}
+
+
+{% blocktrans with name=user.first_name %}Hello {{ name }},{% endblocktrans %}
+
+{% translate "Thank you for reporting your issue. Here is a copy of your report:" %}
+==============================================================================
+
+Operating system: {{data.operating_system}}
+Browser: {{data.browser}}
+Channel: {% if data.channel %}{{data.channel}}{% else %}N/A{% endif %}
+
+Description:
+{{data.description}}
+
+==============================================================================
+
+{% translate "We are currently reviewing the information that you have provided, and will file your issue accordingly." %}
+{% translate "We appreciate your patience and assistance as we work to improve Kolibri Studio!" %}
+
+
+{% translate "Thank you," %}
+
+{% translate "The Learning Equality Team" %}
+
+{% endautoescape %}

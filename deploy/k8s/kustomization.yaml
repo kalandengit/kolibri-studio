@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: kolibri-studio
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  # secrets.yaml is NOT listed: copy secrets.example.yaml -> secrets.yaml,
+  # fill it in and apply it separately (or use kustomize secretGenerator).
+  - postgres.yaml
+  - redis.yaml
+  - minio.yaml
+  - studio-app.yaml
+  - celery-worker.yaml
+  - migrate-job.yaml
+  - ingress.yaml
+images:
+  - name: learningequality/studio-app-prod
+    newName: learningequality/studio-app-prod   # <- your registry, e.g. ghcr.io/you/studio-app-prod
+    newTag: latest

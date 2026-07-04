@@ -1,0 +1,16 @@
+{% load i18n %}
+
+{% autoescape off %}
+{% blocktrans with name=user.first_name %}Hello {{ name }},{% endblocktrans %}
+
+{% blocktrans with site_name=site.name %}Here is your activation link for {{ site_name }}:{% endblocktrans %}
+
+{{ domain }}{% url 'registration_activate' activation_key %}
+
+{% blocktrans %}This link is valid for {{ expiration_days }} days.{% endblocktrans %}
+
+{% translate "Thanks for using Kolibri Studio!" %}
+
+{% translate "The Learning Equality Team" %}
+
+{% endautoescape %}

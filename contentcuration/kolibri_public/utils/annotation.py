@@ -1,0 +1,126 @@
+"""
+Functions in here are a modified subset of annotation functions from Kolibri related to channel metadata.
+https://github.com/learningequality/kolibri/blob/caec91dd2da5617adfb50332fb698068248e8e47/kolibri/core/content/utils/annotation.py#L731
+"""
+from itertools import chain
+
+from django.db.models import Q
+from django.db.models import Sum
+from django.utils import timezone
+from kolibri_public.models import ChannelMetadata
+from kolibri_public.models import ContentNode
+from kolibri_public.models import LocalFile
+from kolibri_public.search import annotate_channelmetadata_label_bitmasks
+from le_utils.constants import content_kinds
+
+from contentcuration.models import Channel
+
+
+def set_channel_metadata_fields(
+    channel_id,
+    public=None,
+    categories=None,
+    countries=None,
+):
+    # Note: The `categories` argument should be a _list_, NOT a _dict_.
+
+    # Remove unneeded db_lock
+    channel_queryset = ChannelMetadata.objects.filter(id=channel_id)
+    channel = channel_queryset.get()
+
+    calculate_published_size(channel)
+    calculate_total_resource_count(channel)
+    calculate_included_languages(channel)
+    calculate_included_categories(channel, categories)
+    calculate_next_order(channel, public=public)
+    # Add this to ensure we keep this up to date.
+    channel.last_updated = timezone.now()
+
+    if public is not None:
+        channel.public = public
+    if countries is not None:
+        channel.countries.set(countries)
+    channel.save()
+
+    annotate_channelmetadata_label_bitmasks(channel_queryset)
+
+
+def files_for_nodes(nodes):
+    return LocalFile.objects.filter(files__contentnode__in=nodes)
+
+
+def total_file_size(files_or_nodes):
+    if issubclass(files_or_nodes.model, LocalFile):
+        localfiles = files_or_nodes
+    elif issubclass(files_or_nodes.model, ContentNode):
+        localfiles = files_for_nodes(files_or_nodes)
+    else:
+        raise TypeError("Expected queryset for LocalFile or ContentNode")
+    return localfiles.distinct().aggregate(Sum("file_size"))["file_size__sum"] or 0
+
+
+def calculate_published_size(channel):
+    content_nodes = ContentNode.objects.filter(channel_id=channel.id)
+    channel.published_size = total_file_size(
+        files_for_nodes(content_nodes).filter(available=True)
+    )
+    channel.save()
+
+
+def calculate_total_resource_count(channel):
+    content_nodes = ContentNode.objects.filter(channel_id=channel.id)
+    channel.total_resource_count = (
+        content_nodes.filter(available=True).exclude(kind=content_kinds.TOPIC).count()
+    )
+    channel.save()
+
+
+def calculate_included_languages(channel):
+    content_nodes = ContentNode.objects.filter(
+        channel_id=channel.id, available=True
+    ).exclude(lang=None)
+    languages = content_nodes.order_by("lang").values_list("lang", flat=True).distinct()
+    channel.included_languages.add(*list(languages))
+
+
+def calculate_included_categories(channel, categories):
+    content_nodes = ContentNode.objects.filter(
+        channel_id=channel.id, available=True
+    ).exclude(categories=None)
+
+    categories_comma_separated_lists = content_nodes.values_list(
+        "categories", flat=True
+    )
+    contentnode_categories = set(
+        chain.from_iterable(
+            (
+                categories_comma_separated_list.split(",")
+                for categories_comma_separated_list in categories_comma_separated_lists
+            )
+        )
+    )
+
+    all_categories = sorted(set(categories or []).union(contentnode_categories))
+    channel.categories = all_categories
+    channel.save()
+
+
+def calculate_next_order(channel, public=False):
+    # This has been edited from the source Kolibri, in order
+    # to make the order match given by the public channel API on Studio.
+    if public:
+        channel_list_order = list(
+            Channel.objects.filter(
+                # Ensure that this channel is always included in the list.
+                Q(public=True, deleted=False, main_tree__published=True)
+                | Q(id=channel.id)
+            )
+            .order_by("-priority")
+            .values_list("id", flat=True)
+        )
+        # this shouldn't happen, but if we're exporting a channel database to Kolibri Public
+        # and the channel does not actually exist locally, then this would fail
+        if channel.id in channel_list_order:
+            order = channel_list_order.index(channel.id)
+            channel.order = order
+            channel.save()

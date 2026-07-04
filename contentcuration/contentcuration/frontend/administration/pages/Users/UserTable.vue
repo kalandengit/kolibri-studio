@@ -1,0 +1,528 @@
+<template>
+
+  <div>
+    <h1 class="font-weight-bold px-4 py-2 title">
+      {{ `${$formatNumber(count)} ${count === 1 ? 'user' : 'users'}` }}
+      <IconButton
+        v-if="count"
+        icon="email"
+        class="ma-0"
+        :color="$themeTokens.primary"
+        :text="`Email ${$formatNumber(count)} ${count === 1 ? 'user' : 'users'}`"
+        @click="showMassEmailDialog = true"
+      />
+      <IconButton
+        icon="download"
+        class="ma-0"
+        :color="$themeTokens.primary"
+        text="Download CSV"
+        data-test="csv"
+        :disabled="!count"
+        @click="onDownloadCSV"
+      />
+    </h1>
+    <EmailUsersDialog
+      v-model="showMassEmailDialog"
+      :userTypeFilter="userTypeFilter"
+      :locationFilter="locationFilter"
+      :keywordFilter="keywordInput"
+      :usersFilterFetchQueryParams="filterFetchQueryParams"
+    />
+    <VLayout
+      wrap
+      class="mb-2"
+    >
+      <VFlex
+        xs12
+        sm4
+        xl3
+        class="px-3"
+      >
+        <VSelect
+          v-model="userTypeFilter"
+          :items="userTypeOptions"
+          item-text="label"
+          item-value="key"
+          label="User Type"
+          box
+          :menu-props="{ offsetY: true }"
+        />
+      </VFlex>
+      <VFlex
+        xs12
+        sm4
+        xl3
+        class="px-3"
+      >
+        <CountryField
+          ref="locationDropdown"
+          v-model="locationFilter"
+          :outline="false"
+          :multiple="false"
+          label="Target location"
+        />
+      </VFlex>
+      <VFlex
+        xs12
+        sm4
+        xl3
+        class="px-3"
+      >
+        <VTextField
+          v-model="keywordInput"
+          label="Search for a user..."
+          prepend-inner-icon="search"
+          clearable
+          box
+          hint="Search for users by their names, emails, or channels"
+          persistent-hint
+          @input="setKeywords"
+          @click:clear="clearSearch"
+        />
+      </VFlex>
+    </VLayout>
+    <VLayout
+      wrap
+      class="mb-2"
+    >
+      <VFlex
+        xs12
+        sm6
+        md3
+        class="px-3"
+      >
+        <VSelect
+          v-model="joinedWithinFilter"
+          :items="joinedWithinOptions"
+          item-text="label"
+          item-value="value"
+          label="Joined within"
+          box
+          :menu-props="{ offsetY: true }"
+        />
+      </VFlex>
+      <VFlex
+        xs12
+        sm6
+        md3
+        class="px-3"
+      >
+        <VSelect
+          v-model="activeWithinFilter"
+          :items="activeWithinOptions"
+          item-text="label"
+          item-value="value"
+          label="Active within"
+          box
+          :menu-props="{ offsetY: true }"
+        />
+      </VFlex>
+      <VFlex
+        xs12
+        sm6
+        md3
+        class="align-center d-flex px-3"
+      >
+        <Checkbox
+          v-model="hasPublishedFilter"
+          label="Has published a channel"
+        />
+      </VFlex>
+      <VFlex
+        xs12
+        sm6
+        md3
+        class="align-center d-flex px-3"
+      >
+        <Checkbox
+          v-model="hasEditsFilter"
+          label="Has Studio edits"
+        />
+      </VFlex>
+    </VLayout>
+    <VDataTable
+      v-model="selected"
+      :headers="headers"
+      :loading="loading"
+      class="table-col-freeze"
+      :pagination.sync="pagination"
+      :total-items="count"
+      :rows-per-page-items="rowsPerPageItems"
+      :items="users"
+      :no-data-text="loading ? 'Loading...' : 'No users found'"
+      :class="{ expanded: $vuetify.breakpoint.mdAndUp }"
+    >
+      <template #progress>
+        <VProgressLinear
+          v-if="loading"
+          color="loading"
+          indeterminate
+        />
+      </template>
+
+      <template #headerCell="{ header }">
+        <div
+          style="display: inline-block; width: min-content"
+          @click.stop
+        >
+          <Checkbox
+            v-if="header.class === 'first'"
+            v-model="selectAll"
+            class="ma-0"
+            :indeterminate="Boolean(selected.length) && selected.length !== users.length"
+          />
+        </div>
+
+        <template v-if="header.class === 'first' && selected.length">
+          <span>({{ selectedCount }})</span>
+          <IconButton
+            icon="email"
+            class="ma-0"
+            text="Email"
+            data-test="email"
+            @click="showEmailDialog = true"
+          />
+        </template>
+        <span v-else>
+          {{ header.text }}
+        </span>
+      </template>
+      <template #items="{ item }">
+        <UserItem
+          v-model="selected"
+          :userId="item"
+          @deleted="loadItems"
+        />
+      </template>
+    </VDataTable>
+    <EmailUsersDialog
+      v-model="showEmailDialog"
+      :initialRecipients="selected"
+    />
+  </div>
+
+</template>
+
+
+<script>
+
+  import { ref, onMounted, computed, getCurrentInstance } from 'vue';
+  import { mapGetters } from 'vuex';
+  import transform from 'lodash/transform';
+  import { saveAs } from 'file-saver';
+  import { useTable } from '../../composables/useTable';
+  import { RouteNames, rowsPerPageItems } from '../../constants';
+  import EmailUsersDialog from './EmailUsersDialog';
+  import UserItem from './UserItem';
+  import client from 'shared/client';
+  import { useFilter } from 'shared/composables/useFilter';
+  import { useKeywordSearch } from 'shared/composables/useKeywordSearch';
+  import { routerMixin } from 'shared/mixins';
+  import IconButton from 'shared/views/IconButton';
+  import Checkbox from 'shared/views/form/Checkbox';
+  import CountryField from 'shared/views/form/CountryField';
+
+  const userTypeFilterMap = {
+    all: { label: 'All', params: {} },
+    active: { label: 'Active', params: { is_active: true } },
+    inactive: { label: 'Inactive', params: { is_active: false } },
+    administrator: { label: 'Administrators', params: { is_admin: true } },
+    sushichef: { label: 'Sushi chef', params: { chef: true } },
+  };
+
+  const DATE_WINDOWS = [
+    { key: 'any', label: 'Any time', months: null },
+    { key: '1mo', label: 'Last month', months: 1 },
+    { key: '3mo', label: 'Last 3 months', months: 3 },
+    { key: '6mo', label: 'Last 6 months', months: 6 },
+    { key: '1yr', label: 'Last year', months: 12 },
+  ];
+
+  function buildDateWindowFilterMap(paramName) {
+    const map = {};
+    for (const window of DATE_WINDOWS) {
+      if (window.months === null) {
+        map[window.key] = { label: window.label, params: {} };
+      } else {
+        const cutoff = new Date();
+        cutoff.setMonth(cutoff.getMonth() - window.months);
+        const iso = cutoff.toISOString().slice(0, 10);
+        map[window.key] = { label: window.label, params: { [paramName]: iso } };
+      }
+    }
+    return map;
+  }
+
+  function useDateWindowFilter({ name, paramName }) {
+    const { filter, options, fetchQueryParams } = useFilter({
+      name,
+      filterMap: buildDateWindowFilterMap(paramName),
+      defaultValue: 'any',
+    });
+    const wrapped = computed({
+      get: () => filter.value.value || 'any',
+      set: value => {
+        filter.value = options.value.find(o => o.value === value) || {};
+      },
+    });
+    return { filter: wrapped, options, fetchQueryParams };
+  }
+
+  function useBooleanFilter({ name, label, paramName }) {
+    const filterMap = {
+      no: { label: 'Any', params: {} },
+      yes: { label, params: { [paramName]: true } },
+    };
+    const { filter, options, fetchQueryParams } = useFilter({
+      name,
+      filterMap,
+      defaultValue: 'no',
+    });
+    const wrapped = computed({
+      get: () => filter.value.value === 'yes',
+      set: value => {
+        const targetKey = value ? 'yes' : 'no';
+        filter.value = options.value.find(o => o.value === targetKey) || {};
+      },
+    });
+    return { filter: wrapped, fetchQueryParams };
+  }
+
+  export default {
+    name: 'UserTable',
+    components: {
+      Checkbox,
+      IconButton,
+      EmailUsersDialog,
+      UserItem,
+      CountryField,
+    },
+    mixins: [routerMixin],
+    setup() {
+      const { proxy } = getCurrentInstance();
+      const store = proxy.$store;
+
+      const {
+        filter: _userTypeFilter,
+        options: userTypeOptions,
+        fetchQueryParams: userTypeFetchQueryParams,
+      } = useFilter({
+        name: 'userType',
+        filterMap: userTypeFilterMap,
+      });
+      // Temporal wrapper, must be removed after migrating to KSelect
+      const userTypeFilter = computed({
+        get: () => _userTypeFilter.value.value || undefined,
+        set: value => {
+          _userTypeFilter.value =
+            userTypeOptions.value.find(option => option.value === value) || {};
+        },
+      });
+
+      const {
+        keywordInput,
+        setKeywords,
+        clearSearch,
+        fetchQueryParams: keywordSearchFetchQueryParams,
+      } = useKeywordSearch();
+
+      const locationFilterMap = ref({});
+      const locationDropdown = ref(null);
+
+      const {
+        filter: _locationFilter,
+        options: locationOptions,
+        fetchQueryParams: locationFetchQueryParams,
+      } = useFilter({
+        name: 'location',
+        filterMap: locationFilterMap,
+      });
+      // Temporal wrapper, must be removed after migrating to KSelect
+      const locationFilter = computed({
+        get: () => _locationFilter.value.value || undefined,
+        set: value => {
+          _locationFilter.value =
+            locationOptions.value.find(option => option.value === value) || {};
+        },
+      });
+
+      const {
+        filter: joinedWithinFilter,
+        options: joinedWithinOptions,
+        fetchQueryParams: joinedWithinFetchQueryParams,
+      } = useDateWindowFilter({ name: 'joinedWithin', paramName: 'joined_since' });
+
+      const {
+        filter: activeWithinFilter,
+        options: activeWithinOptions,
+        fetchQueryParams: activeWithinFetchQueryParams,
+      } = useDateWindowFilter({ name: 'activeWithin', paramName: 'active_since' });
+
+      const { filter: hasPublishedFilter, fetchQueryParams: hasPublishedFetchQueryParams } =
+        useBooleanFilter({
+          name: 'hasPublished',
+          label: 'Has published a channel',
+          paramName: 'published_channel',
+        });
+
+      const { filter: hasEditsFilter, fetchQueryParams: hasEditsFetchQueryParams } =
+        useBooleanFilter({
+          name: 'hasEdits',
+          label: 'Has Studio edits',
+          paramName: 'has_edits',
+        });
+
+      onMounted(() => {
+        // The locationFilterMap is built from the options in the CountryField component,
+        // so we need to wait until it's mounted to access them.
+        const locationOptions = locationDropdown.value.options;
+
+        locationFilterMap.value = transform(
+          locationOptions,
+          (result, option) => {
+            result[option.id] = {
+              label: option.name,
+              params: { location: option.id },
+            };
+          },
+          {},
+        );
+      });
+
+      const filterFetchQueryParams = computed(() => {
+        return {
+          ...userTypeFetchQueryParams.value,
+          ...locationFetchQueryParams.value,
+          ...keywordSearchFetchQueryParams.value,
+          ...joinedWithinFetchQueryParams.value,
+          ...activeWithinFetchQueryParams.value,
+          ...hasPublishedFetchQueryParams.value,
+          ...hasEditsFetchQueryParams.value,
+        };
+      });
+
+      function loadUsers(fetchParams) {
+        return store.dispatch('userAdmin/loadUsers', fetchParams);
+      }
+
+      const { pagination, loading, loadItems } = useTable({
+        fetchFunc: fetchParams => loadUsers(fetchParams),
+        filterFetchQueryParams,
+      });
+
+      return {
+        userTypeFilter,
+        userTypeOptions,
+        locationDropdown,
+        locationFilter,
+        keywordInput,
+        setKeywords,
+        clearSearch,
+        joinedWithinFilter,
+        joinedWithinOptions,
+        activeWithinFilter,
+        activeWithinOptions,
+        hasPublishedFilter,
+        hasEditsFilter,
+        pagination,
+        loading,
+        loadItems,
+        filterFetchQueryParams,
+      };
+    },
+    data() {
+      return {
+        selected: [],
+        showEmailDialog: false,
+        showMassEmailDialog: false,
+      };
+    },
+    computed: {
+      ...mapGetters('userAdmin', ['users', 'count']),
+      selectAll: {
+        get() {
+          return (
+            Boolean(this.selected.length) &&
+            this.selected.length === this.users.length &&
+            !this.loading
+          );
+        },
+        set(value) {
+          if (value) {
+            this.selected = this.users;
+          } else {
+            this.selected = [];
+          }
+        },
+      },
+      headers() {
+        const firstColumn = this.$vuetify.breakpoint.smAndDown
+          ? [{ class: 'first', sortable: false }]
+          : [];
+        return firstColumn.concat([
+          {
+            text: 'Name',
+            align: 'left',
+            value: 'last_name',
+            class: `${this.$vuetify.breakpoint.smAndDown ? '' : 'first'}`,
+          },
+          { text: 'Email', value: 'email' },
+          { text: 'Disk space', value: 'disk_space' },
+          { text: 'Can edit', value: 'edit_count', sortable: false },
+          { text: 'Can view', value: 'view_count', sortable: false },
+          { text: 'Date joined', value: 'date_joined' },
+          { text: 'Last active', value: 'last_login' },
+          { text: 'Actions', sortable: false, align: 'center' },
+        ]);
+      },
+      selectedCount() {
+        return this.selected.length;
+      },
+      rowsPerPageItems() {
+        return rowsPerPageItems;
+      },
+    },
+    watch: {
+      $route: {
+        deep: true,
+        handler(newRoute, oldRoute) {
+          if (newRoute.name === oldRoute.name && newRoute.name === RouteNames.USERS)
+            this.selected = [];
+        },
+      },
+      'users.length'() {
+        this.selected = [];
+      },
+    },
+    mounted() {
+      this.updateTabTitle('Users - Administration');
+    },
+    methods: {
+      async onDownloadCSV() {
+        this.$store.dispatch('showSnackbarSimple', 'Generating CSV...');
+        try {
+          const response = await client.get(window.Urls.admin_users_download_csv(), {
+            params: this.filterFetchQueryParams,
+            responseType: 'blob',
+          });
+          const filename = `studio_users_${new Date().toISOString().slice(0, 10)}.csv`;
+          saveAs(response.data, filename);
+        } catch (error) {
+          const status = error.response && error.response.status;
+          if (status === 412) {
+            this.$store.dispatch(
+              'showSnackbarSimple',
+              'No filters applied. Pick at least one filter and try again.',
+            );
+          } else {
+            this.$store.dispatch('showSnackbarSimple', 'CSV download failed. Try again.');
+          }
+        }
+      },
+    },
+  };
+
+</script>
+
+
+<style lang="scss" scoped></style>

@@ -1,0 +1,37 @@
+<!DOCTYPE HTML>
+{% extends "base.html" %}
+{% load static %}
+{% load i18n %}
+{% load render_bundle_css from translation_tags %}
+{% load render_bundle from webpack_loader %}
+
+{% block css_bundle %}
+  {% render_bundle_css 'channel_list' %}
+{% endblock css_bundle %}
+
+{% block title %}
+	{% if LIBRARY_MODE %}{% translate 'Kolibri Content Library Catalog' %}
+	{% else %}{% translate 'Kolibri Studio' %}
+	{% endif %}
+{% endblock title %}
+
+{% block analytics_data_layer %}
+<script>
+  // Google tag manager data layer https://developers.google.com/tag-manager/devguide
+  dataLayer.push({
+    pageCategory: 'Channel list',
+    currentUser: window.user,
+  });
+</script>
+{% endblock analytics_data_layer %}
+
+{% block content %}
+	<script>
+		var libraryMode = "{{ LIBRARY_MODE }}" === "True";
+		var publicLanguages = JSON.parse({{ public_languages | safe }});
+		var publicLicenses = JSON.parse({{ public_licenses | safe }});
+		var publicKinds = JSON.parse({{ public_kinds | safe }});
+	</script>
+	{% render_bundle 'channel_list' 'js' %}
+
+{% endblock content %}

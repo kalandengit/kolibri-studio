@@ -1,0 +1,9 @@
+node_modules/
+.git/
+.tox
+.coverage
+__pycache__
+*.pyc
+*.swp
+k8s/templates/
+cloudbuild-*.yaml

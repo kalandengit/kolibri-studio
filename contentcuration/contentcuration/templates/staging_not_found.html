@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% load static %}
+{% load i18n %}
+{% block nav %}{% endblock nav %}
+
+{% block analytics_data_layer %}
+<script>
+  // Google tag manager data layer https://developers.google.com/tag-manager/devguide
+  dataLayer.push({
+    pageCategory: 'Staging not found',
+    currentUser: window.user,
+  });
+</script>
+{% endblock analytics_data_layer %}
+
+{% block content %}
+<div class="message-page">
+  <div class="pull-left message-img-wrapper">
+    <img class="message-logo" src="{% static 'img/kolibri-logo.png' %}"/>
+  </div>
+  <div class="message-wrapper">
+    <h2>{% translate "No updates to review." %}</h2>
+    <a class="btn message-btn" href="/">{% translate "Go Home" %}</a>
+  </div>
+</div>
+
+{% endblock %}

@@ -1,0 +1,27 @@
+# Run once per deployment/upgrade:
+#   kubectl -n kolibri-studio delete job studio-migrate --ignore-not-found
+#   kubectl apply -f migrate-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: studio-migrate
+  namespace: kolibri-studio
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: learningequality/studio-app-prod:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              make migrate
+              python contentcuration/manage.py createcachetable || true
+          envFrom:
+            - configMapRef:
+                name: studio-config
+            - secretRef:
+                name: studio-secrets

@@ -1,0 +1,57 @@
+FROM ghcr.io/astral-sh/uv:python3.10-trixie-slim
+
+# Set the timezone
+RUN ln -fs /usr/share/zoneinfo/America/Los_Angeles /etc/localtime
+
+# Studio source directory ######################################################
+RUN mkdir /src
+WORKDIR /src
+################################################################################
+
+
+# System packages ##############################################################
+ENV DEBIAN_FRONTEND=noninteractive
+# Default Python file.open file encoding to UTF-8 instead of ASCII, workaround for le-utils setup.py issue
+ENV LANG=C.UTF-8
+
+RUN apt-get update && \
+    apt-get -y install --no-install-recommends \
+        curl \
+        fish \
+        man \
+        gcc \
+        libpq-dev \
+        libssl-dev \
+        libffi-dev \
+        make \
+        git \
+        gettext \
+        libjpeg-dev \
+        ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy Node.js from its image (does a merge)
+COPY --from=node:20-trixie-slim /usr/local /usr/local
+################################################################################
+
+
+# Node packages ################################################################
+RUN corepack enable pnpm
+COPY ./package.json ./pnpm-lock.yaml  /src/
+RUN pnpm install
+################################################################################
+
+
+# Python packages ##############################################################
+COPY requirements.txt requirements-dev.txt   /src/
+
+# install pinned deps from pip-tools into system
+RUN uv pip sync --system requirements.txt requirements-dev.txt
+################################################################################
+
+
+# Final cleanup ################################################################
+RUN apt-get -y autoremove
+################################################################################
+
+CMD ["pnpm", "run", "devserver"]

@@ -43,14 +43,51 @@ x-studio-worker: &studio-worker
 services:
   studio-app:
     <<: *studio-worker
-    # gunicorn on 8081 (see `make altprodserver`)
-    ports:
-      - "${STUDIO_HTTP_PORT:-8080}:8081"
+    # collectstatic into the shared volume, then gunicorn on 8081.
+    # (skips `make compilemessages`: gettext is absent from the prod image;
+    # untranslated strings simply fall back to English)
+    entrypoint: []
+    command:
+      - /bin/bash
+      - -c
+      - |
+        export STATICFILES_DIR=/static_root
+        python contentcuration/manage.py collectstatic --noinput
+        cd contentcuration && exec gunicorn contentcuration.wsgi:application \
+          --workers=$${GUNICORN_WORKERS:-2} --threads=$${GUNICORN_THREADS:-4} \
+          --timeout=4000 --bind=0.0.0.0:8081 --log-level=info
+    volumes:
+      - static:/static_root
 
   celery-worker:
     <<: *studio-worker
     entrypoint: []
     command: make prodceleryworkers
+
+  # Serves /static/ from the shared volume, proxies /content/ to MinIO and
+  # everything else to gunicorn. The stock nginx.conf targets 127.0.0.1:8081
+  # (same-pod k8s layout), so rewrite the upstream to the compose service name.
+  studio-nginx:
+    image: learningequality/studio-nginx-prod
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.nginx.prod
+    restart: unless-stopped
+    depends_on:
+      - studio-app
+    environment:
+      AWS_BUCKET_NAME: ${MINIO_BUCKET:-content}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        sed -i 's/server 127.0.0.1:8081;/server studio-app:8081;/' /etc/nginx/nginx.conf
+        sed -i 's#alias /app/contentworkshop_static/;#alias /static_root/;#' /etc/nginx/nginx.conf
+        exec entrypoint.sh
+    volumes:
+      - static:/static_root:ro
+    ports:
+      - "${STUDIO_HTTP_PORT:-8080}:8080"
 
   postgres:
     image: postgres:16
@@ -101,3 +138,4 @@ services:
 volumes:
   pgdata:
   minio:
+  static:

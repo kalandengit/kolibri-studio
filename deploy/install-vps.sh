@@ -84,8 +84,8 @@ compose() {
 }
 
 # --- 4. Build and start --------------------------------------------------------
-log "Building the Studio image (first build takes 10-20 min)..."
-compose build studio-app
+log "Building the Studio images (first build takes 10-20 min)..."
+compose build
 
 log "Starting services..."
 compose up -d

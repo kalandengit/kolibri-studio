@@ -37,7 +37,9 @@ WORKDIR /contentcuration
 # generate the node bundles
 RUN mkdir -p contentcuration/static/js/bundles
 RUN ln -s /node_modules /contentcuration/node_modules
-RUN pnpm run build
+# Cap the V8 heap explicitly: on low-RAM servers the webpack production build
+# aborts (SIGABRT/exit 134) with default heap sizing.
+RUN NODE_OPTIONS="--max-old-space-size=3072" pnpm run build
 
 ARG COMMIT_SHA
 ENV RELEASE_COMMIT_SHA=$COMMIT_SHA

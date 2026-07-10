@@ -25,11 +25,11 @@ x-studio-environment: &studio-environment
   SHELL: /bin/bash
   RUN_MODE: docker-compose
 
+# NOTE: only studio-app carries a `build:` section; celery-worker reuses the
+# built image. Giving both a build config makes compose run the expensive
+# webpack build twice in parallel, which OOMs small servers.
 x-studio-worker: &studio-worker
   image: learningequality/studio-app-prod
-  build:
-    context: ..
-    dockerfile: docker/Dockerfile.prod
   restart: unless-stopped
   depends_on:
     postgres:
@@ -43,6 +43,9 @@ x-studio-worker: &studio-worker
 services:
   studio-app:
     <<: *studio-worker
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.prod
     # collectstatic into the shared volume, then gunicorn on 8081.
     # (skips `make compilemessages`: gettext is absent from the prod image;
     # untranslated strings simply fall back to English)

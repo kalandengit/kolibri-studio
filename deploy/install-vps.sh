@@ -116,7 +116,37 @@ if [[ "$WITH_DEMO_DATA" == "1" ]]; then
   compose exec -T studio-app python contentcuration/manage.py setup
 fi
 
-# --- 6. Smoke test -----------------------------------------------------------------
+# --- 6. Firewall + boot persistence ---------------------------------------------------
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+  log "ufw is active - allowing port ${STUDIO_HTTP_PORT}/tcp..."
+  ufw allow "${STUDIO_HTTP_PORT}/tcp" || true
+elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+  log "firewalld is active - allowing port ${STUDIO_HTTP_PORT}/tcp..."
+  firewall-cmd --permanent --add-port="${STUDIO_HTTP_PORT}/tcp" && firewall-cmd --reload || true
+fi
+
+log "Installing systemd unit so the stack starts on every boot..."
+cat > /etc/systemd/system/kolibri-studio.service <<EOF
+[Unit]
+Description=Kolibri Studio (docker compose stack)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=$SCRIPT_DIR
+ExecStart=/usr/bin/docker compose -f $COMPOSE_FILE --env-file $ENV_FILE up -d --remove-orphans
+ExecStop=/usr/bin/docker compose -f $COMPOSE_FILE --env-file $ENV_FILE stop
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable kolibri-studio.service >/dev/null 2>&1 || true
+
+# --- 7. Smoke test -----------------------------------------------------------------
 log "Smoke test: waiting for the app to answer on port ${STUDIO_HTTP_PORT}..."
 ok=""
 for i in $(seq 1 30); do
@@ -135,7 +165,7 @@ if [[ -z "$ok" ]]; then
 fi
 log "Smoke test passed (HTTP ${code})."
 
-# --- 7. Report -------------------------------------------------------------------
+# --- 8. Report -------------------------------------------------------------------
 IP="$(curl -fsS -m 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
 log "=================================================================="
 log "Kolibri Studio is up:  http://${IP}:${STUDIO_HTTP_PORT}/"

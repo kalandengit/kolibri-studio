@@ -19,7 +19,10 @@
 param(
     [string]$InstallRoot = "$env:USERPROFILE\kolibri-studio-env",
     [int]$Port = 8080,
-    [switch]$NoDemoData
+    [switch]$NoDemoData,
+    # Directory with a pre-downloaded payload (built by build-offline-bundle.ps1):
+    # runtimes, python wheels, pnpm store and pnpm.exe. Nothing is downloaded.
+    [string]$OfflineDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -45,6 +48,12 @@ New-Item -ItemType Directory -Force $DataDir   | Out-Null
 
 function Fetch($url, $dest) {
     if (Test-Path $dest) { Log "already downloaded: $(Split-Path -Leaf $dest)"; return }
+    $leaf = Split-Path -Leaf $dest
+    if ($OfflineDir) {
+        $local = Join-Path $OfflineDir "downloads\$leaf"
+        if (Test-Path $local) { Log "using bundled $leaf"; Copy-Item $local $dest; return }
+        throw "offline mode: $local missing from the bundle"
+    }
     Log "downloading $url"
     & curl.exe -fsSL -o $dest $url
     if ($LASTEXITCODE -ne 0) { throw "download failed: $url" }
@@ -97,17 +106,30 @@ if (-not (Test-Path $VPy)) {
     & $VPy -m pip install -q -U pip wheel setuptools
 }
 Log "installing backend requirements (first run takes a few minutes)"
-& $VPy -m pip install -q -r "$ProjectRoot\requirements.txt" -r "$ProjectRoot\requirements-dev.txt"
+if ($OfflineDir -and (Test-Path "$OfflineDir\wheels")) {
+    & $VPy -m pip install -q --no-index --find-links "$OfflineDir\wheels" -r "$ProjectRoot\requirements.txt" -r "$ProjectRoot\requirements-dev.txt"
+} else {
+    & $VPy -m pip install -q -r "$ProjectRoot\requirements.txt" -r "$ProjectRoot\requirements-dev.txt"
+}
 if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
 
 # --- 4. Frontend deps ------------------------------------------------------------
 $env:PATH = "$NodeDir;$env:PATH"
 $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = "0"
+$PnpmForBat = "%ENV%\node\pnpm.cmd"
 Push-Location $ProjectRoot
 try {
-    & "$NodeDir\corepack.cmd" enable | Out-Null
-    Log "installing frontend packages with pnpm (first run takes 10-20 min)"
-    & "$NodeDir\pnpm.cmd" install
+    if ($OfflineDir -and (Test-Path "$OfflineDir\pnpm.exe")) {
+        Copy-Item "$OfflineDir\pnpm.exe" "$InstallRoot\pnpm.exe" -Force
+        $PnpmForBat = "%ENV%\pnpm.exe"
+        $env:npm_config_store_dir = "$OfflineDir\pnpm-store"
+        Log "installing frontend packages from the bundled pnpm store"
+        & "$InstallRoot\pnpm.exe" install --offline
+    } else {
+        & "$NodeDir\corepack.cmd" enable | Out-Null
+        Log "installing frontend packages with pnpm (first run takes 10-20 min)"
+        & "$NodeDir\pnpm.cmd" install
+    }
     if ($LASTEXITCODE -ne 0) { throw "pnpm install failed" }
 } finally { Pop-Location }
 
@@ -178,7 +200,7 @@ set MINIO_ROOT_USER=development
 set MINIO_ROOT_PASSWORD=development
 start "minio"  /min "%ENV%\downloads\minio.exe" server "%ENV%\data\minio" --address :9000 --console-address :9001
 start "celery" /min cmd /c "cd /d %PROJ%\contentcuration && set DJANGO_SETTINGS_MODULE=contentcuration.dev_settings&& %ENV%\venv\Scripts\celery.exe -A contentcuration worker --pool=solo -l info --without-mingle --without-gossip"
-start "webpack" /min cmd /c "cd /d %PROJ% && %ENV%\node\pnpm.cmd run build:dev"
+start "webpack" /min cmd /c "cd /d %PROJ% && $PnpmForBat run build:dev"
 echo Kolibri Studio starting on http://127.0.0.1:$Port  (login: a@a.com / a)
 start "" /min cmd /c "timeout /t 15 >nul & start http://127.0.0.1:$Port/"
 cd /d %PROJ%\contentcuration

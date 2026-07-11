@@ -24,6 +24,8 @@ x-studio-environment: &studio-environment
   MPLBACKEND: ps
   SHELL: /bin/bash
   RUN_MODE: docker-compose
+  GUNICORN_WORKERS: ${GUNICORN_WORKERS:-2}
+  GUNICORN_THREADS: ${GUNICORN_THREADS:-4}
 
 # NOTE: only studio-app carries a `build:` section; celery-worker reuses the
 # built image. Giving both a build config makes compose run the expensive

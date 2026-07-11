@@ -74,6 +74,10 @@ MINIO_ROOT_PASSWORD=$(openssl rand -hex 16)
 MINIO_BUCKET=content
 CELERY_TIMEZONE=UTC
 EOF
+  # Single web worker on low-RAM servers
+  if (( $(awk '/MemTotal/ {print $2}' /proc/meminfo) < 2500000 )); then
+    echo "GUNICORN_WORKERS=1" >> "$ENV_FILE"
+  fi
   chmod 600 "$ENV_FILE"
 else
   log "Reusing existing $ENV_FILE"

@@ -2,12 +2,12 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Django: runserver (8080)",
+      "name": "Django: runserver (9090)",
       "type": "debugpy",
       "request": "launch",
       "python": "${env:USERPROFILE}\\kolibri-studio-env\\venv\\Scripts\\python.exe",
       "program": "${workspaceFolder}\\contentcuration\\manage.py",
-      "args": ["runserver", "--noreload", "--settings=contentcuration.dev_settings", "127.0.0.1:8080"],
+      "args": ["runserver", "--noreload", "--settings=contentcuration.dev_settings", "127.0.0.1:9090"],
       "cwd": "${workspaceFolder}\\contentcuration",
       "django": true,
       "justMyCode": false,

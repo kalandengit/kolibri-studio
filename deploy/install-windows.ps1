@@ -180,9 +180,24 @@ start "minio"  /min "%ENV%\downloads\minio.exe" server "%ENV%\data\minio" --addr
 start "celery" /min cmd /c "cd /d %PROJ%\contentcuration && set DJANGO_SETTINGS_MODULE=contentcuration.dev_settings&& %ENV%\venv\Scripts\celery.exe -A contentcuration worker --pool=solo -l info --without-mingle --without-gossip"
 start "webpack" /min cmd /c "cd /d %PROJ% && %ENV%\node\pnpm.cmd run build:dev"
 echo Kolibri Studio starting on http://127.0.0.1:$Port  (login: a@a.com / a)
+start "" /min cmd /c "timeout /t 15 >nul & start http://127.0.0.1:$Port/"
 cd /d %PROJ%\contentcuration
 "%ENV%\venv\Scripts\python.exe" manage.py runserver --settings=contentcuration.dev_settings --noreload 127.0.0.1:$Port
 "@ | Set-Content -Encoding ascii $Bat
+
+# --- 9. Desktop shortcut -------------------------------------------------------------------
+$IconSrc = Join-Path $ProjectRoot "contentcuration\contentcuration\static\img\logo.ico"
+$IconDst = Join-Path $InstallRoot "kolibri-studio.ico"
+if (Test-Path $IconSrc) { Copy-Item $IconSrc $IconDst -Force }
+$Shortcut = Join-Path ([Environment]::GetFolderPath("Desktop")) "Kolibri Studio.lnk"
+$Shell = New-Object -ComObject WScript.Shell
+$Lnk = $Shell.CreateShortcut($Shortcut)
+$Lnk.TargetPath = $Bat
+$Lnk.WorkingDirectory = $InstallRoot
+if (Test-Path $IconDst) { $Lnk.IconLocation = "$IconDst,0" }
+$Lnk.Description = "Start Kolibri Studio (http://127.0.0.1:$Port)"
+$Lnk.Save()
+Log "Desktop shortcut created: $Shortcut"
 
 Log "=================================================================="
 Log "Install complete."

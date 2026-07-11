@@ -44,6 +44,18 @@ account `a@a.com` / `a`.
 Put a reverse proxy with TLS (Caddy, nginx + certbot) in front of the port
 for public deployments, and review `deploy/.env` before real use.
 
+## Operations scripts
+
+| Script | What it does |
+|---|---|
+| `update-vps.sh` | pull latest code + images, restart, migrate, smoke test |
+| `status-vps.sh` | container states, app health, RAM/disk at a glance |
+| `backup-vps.sh [dir]` | dump PostgreSQL + archive content files + save .env |
+| `restore-vps.sh <db.sql.gz> [content.tar.gz]` | restore a backup (asks for confirmation) |
+| `create-admin-vps.sh <email> <password>` | create or promote an admin account |
+| `install-windows.ps1` | full native Windows install (see below) |
+| `stop-windows.ps1` | stop all Studio processes started on Windows |
+
 ## The Docker image
 
 `docker/Dockerfile.prod` (upstream) builds a single image containing the

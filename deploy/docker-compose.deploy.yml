@@ -88,7 +88,7 @@ services:
       - |
         sed -i 's/server 127.0.0.1:8081;/server studio-app:8081;/' /etc/nginx/nginx.conf
         sed -i 's#alias /app/contentworkshop_static/;#alias /static_root/;#' /etc/nginx/nginx.conf
-        exec entrypoint.sh
+        exec sh /usr/bin/entrypoint.sh
     volumes:
       - static:/static_root:ro
     ports:

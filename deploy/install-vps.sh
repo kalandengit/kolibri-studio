@@ -116,7 +116,26 @@ if [[ "$WITH_DEMO_DATA" == "1" ]]; then
   compose exec -T studio-app python contentcuration/manage.py setup
 fi
 
-# --- 6. Report -------------------------------------------------------------------
+# --- 6. Smoke test -----------------------------------------------------------------
+log "Smoke test: waiting for the app to answer on port ${STUDIO_HTTP_PORT}..."
+ok=""
+for i in $(seq 1 30); do
+  code="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:${STUDIO_HTTP_PORT}/" || true)"
+  case "$code" in 200|301|302) ok=1; break;; esac
+  sleep 3
+done
+if [[ -z "$ok" ]]; then
+  log "SMOKE TEST FAILED (last status: ${code:-none}). Container states:"
+  compose ps
+  log "Last studio-nginx logs:"
+  compose logs --tail 20 studio-nginx || true
+  log "Last studio-app logs:"
+  compose logs --tail 20 studio-app || true
+  fail "The stack started but the app is not answering. See logs above."
+fi
+log "Smoke test passed (HTTP ${code})."
+
+# --- 7. Report -------------------------------------------------------------------
 IP="$(curl -fsS -m 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
 log "=================================================================="
 log "Kolibri Studio is up:  http://${IP}:${STUDIO_HTTP_PORT}/"

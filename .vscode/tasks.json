@@ -1,0 +1,41 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Services: start Postgres + Redis + MinIO",
+      "type": "shell",
+      "options": { "shell": { "executable": "powershell.exe", "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"] } },
+      "command": "$e=\"$env:USERPROFILE\\kolibri-studio-env\"; & \"$e\\pgsql\\bin\\pg_ctl.exe\" -D \"$e\\data\\pg\" status *> $null; if ($LASTEXITCODE -ne 0) { & \"$e\\pgsql\\bin\\pg_ctl.exe\" -D \"$e\\data\\pg\" -l \"$e\\data\\pg.log\" start }; if (-not (Get-NetTCPConnection -LocalPort 6379 -State Listen -ErrorAction SilentlyContinue)) { Start-Process -WindowStyle Hidden \"$e\\redis\\redis-server.exe\" -ArgumentList '--port 6379 --maxmemory 256mb' }; if (-not (Get-NetTCPConnection -LocalPort 9000 -State Listen -ErrorAction SilentlyContinue)) { $env:MINIO_ROOT_USER='development'; $env:MINIO_ROOT_PASSWORD='development'; Start-Process -WindowStyle Hidden \"$e\\downloads\\minio.exe\" -ArgumentList \"server `\"$e\\data\\minio`\" --address :9000 --console-address :9001\" }; Write-Host 'services ready'",
+      "problemMatcher": []
+    },
+    {
+      "label": "Webpack: dev server",
+      "type": "shell",
+      "options": { "cwd": "${workspaceFolder}", "env": { "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0" } },
+      "command": "${env:USERPROFILE}\\kolibri-studio-env\\node\\pnpm.cmd run build:dev",
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "Tests: backend (pytest)",
+      "type": "shell",
+      "options": { "cwd": "${workspaceFolder}" },
+      "command": "${env:USERPROFILE}\\kolibri-studio-env\\venv\\Scripts\\python.exe -m pytest contentcuration -x -q",
+      "problemMatcher": []
+    },
+    {
+      "label": "Tests: frontend (jest)",
+      "type": "shell",
+      "options": { "cwd": "${workspaceFolder}", "env": { "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0" } },
+      "command": "${env:USERPROFILE}\\kolibri-studio-env\\node\\pnpm.cmd run test",
+      "problemMatcher": []
+    },
+    {
+      "label": "Studio: stop everything",
+      "type": "shell",
+      "options": { "shell": { "executable": "powershell.exe", "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"] } },
+      "command": "${workspaceFolder}\\deploy\\stop-windows.ps1",
+      "problemMatcher": []
+    }
+  ]
+}

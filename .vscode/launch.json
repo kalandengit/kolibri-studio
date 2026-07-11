@@ -1,0 +1,28 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Django: runserver (8080)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${env:USERPROFILE}\\kolibri-studio-env\\venv\\Scripts\\python.exe",
+      "program": "${workspaceFolder}\\contentcuration\\manage.py",
+      "args": ["runserver", "--noreload", "--settings=contentcuration.dev_settings", "127.0.0.1:8080"],
+      "cwd": "${workspaceFolder}\\contentcuration",
+      "django": true,
+      "justMyCode": false,
+      "preLaunchTask": "Services: start Postgres + Redis + MinIO"
+    },
+    {
+      "name": "Celery worker (solo pool)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${env:USERPROFILE}\\kolibri-studio-env\\venv\\Scripts\\python.exe",
+      "module": "celery",
+      "args": ["-A", "contentcuration", "worker", "--pool=solo", "-l", "info", "--without-mingle", "--without-gossip"],
+      "cwd": "${workspaceFolder}\\contentcuration",
+      "env": { "DJANGO_SETTINGS_MODULE": "contentcuration.dev_settings" },
+      "justMyCode": false
+    }
+  ]
+}

@@ -29,7 +29,7 @@ x-studio-environment: &studio-environment
 # built image. Giving both a build config makes compose run the expensive
 # webpack build twice in parallel, which OOMs small servers.
 x-studio-worker: &studio-worker
-  image: learningequality/studio-app-prod
+  image: ghcr.io/kalandengit/studio-app-prod:latest
   restart: unless-stopped
   depends_on:
     postgres:
@@ -71,7 +71,7 @@ services:
   # everything else to gunicorn. The stock nginx.conf targets 127.0.0.1:8081
   # (same-pod k8s layout), so rewrite the upstream to the compose service name.
   studio-nginx:
-    image: learningequality/studio-nginx-prod
+    image: ghcr.io/kalandengit/studio-nginx-prod:latest
     build:
       context: ..
       dockerfile: docker/Dockerfile.nginx.prod

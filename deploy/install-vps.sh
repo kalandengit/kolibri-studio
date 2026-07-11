@@ -84,8 +84,12 @@ compose() {
 }
 
 # --- 4. Build and start --------------------------------------------------------
-log "Building the Studio images (first build takes 10-20 min)..."
-compose build
+if compose pull studio-app studio-nginx; then
+  log "Using prebuilt images from GHCR."
+else
+  log "Prebuilt images unavailable; building locally (10-20 min, needs ~4 GB RAM+swap)..."
+  compose build
+fi
 
 log "Starting services..."
 compose up -d

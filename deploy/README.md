@@ -5,8 +5,27 @@ Three options, from simplest to most scalable:
 | Option | For | How |
 |---|---|---|
 | **Cloud VPS (Docker Compose)** | one server, demo/staging/small prod | `sudo bash deploy/install-vps.sh --with-demo-data` |
-| **Docker image only** | your own orchestration | `docker build -t studio-app-prod -f docker/Dockerfile.prod .` |
+| **Docker image only** | your own orchestration | pulled from GHCR by CI, or `docker build -t studio-app-prod -f docker/Dockerfile.prod .` |
 | **Kubernetes** | scalable production | see [k8s/README.md](k8s/README.md) |
+| **Windows (native, no Docker/admin)** | local development on Windows | `powershell -ExecutionPolicy Bypass -File deploy\install-windows.ps1` |
+
+## Windows quick start
+
+From a checkout of this repo, in a regular (non-admin) PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\install-windows.ps1
+```
+
+Installs portable Python 3.10, Node 20 + pnpm, PostgreSQL 16, Redis and MinIO
+under `%USERPROFILE%\kolibri-studio-env`, installs all dependencies, migrates
+and seeds the database, and generates `start-studio.bat`. Options:
+`-InstallRoot <dir>`, `-Port <n>`, `-NoDemoData`. Re-running skips completed
+steps. Afterwards, launch everything with:
+
+```
+%USERPROFILE%\kolibri-studio-env\start-studio.bat
+```
 
 ## Cloud VPS quick start
 
